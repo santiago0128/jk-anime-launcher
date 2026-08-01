@@ -20,7 +20,9 @@ const TMDB_API = 'https://api.themoviedb.org/3';
 const ANILIST_API = 'https://graphql.anilist.co';
 const TIEMPO_LIMITE = 20000;
 
-function pedirJson(url, { metodo = 'GET', cabeceras = {}, cuerpo = null } = {}) {
+// QLever responde 308 a la URL sin barra final, así que seguir redirecciones
+// no es opcional aquí.
+function pedirJson(url, { metodo = 'GET', cabeceras = {}, cuerpo = null, saltos = 3 } = {}) {
   return new Promise((resolve, reject) => {
     const datos = cuerpo ? JSON.stringify(cuerpo) : null;
     const opciones = {
@@ -34,6 +36,14 @@ function pedirJson(url, { metodo = 'GET', cabeceras = {}, cuerpo = null } = {}) 
     };
 
     const peticion = https.request(url, opciones, (respuesta) => {
+      const destino = respuesta.headers?.location;
+      if (respuesta.statusCode >= 300 && respuesta.statusCode < 400 && destino && saltos > 0) {
+        respuesta.resume();
+        return resolve(
+          pedirJson(new URL(destino, url), { metodo, cabeceras, cuerpo, saltos: saltos - 1 })
+        );
+      }
+
       let texto = '';
       respuesta.on('data', (c) => (texto += c));
       respuesta.on('end', () => {
@@ -228,6 +238,141 @@ async function porTitulo(busqueda, limite) {
     .slice(0, limite);
 }
 
+// --------------------------------------------------------- Wikidata/QLever
+
+// Cine y series sin clave ni registro. El dato es de Wikidata, pero se
+// consulta a través de QLever (Universidad de Friburgo) en vez del servicio
+// oficial: ese devuelve HTTP 429 a la segunda petición seguida, y este aguanta
+// sin rechistar. Los nombres se resuelven con la API normal de Wikidata, que
+// tampoco limita.
+const QLEVER = 'https://qlever.dev/api/wikidata/';
+const WIKIDATA_API = 'https://www.wikidata.org/w/api.php';
+const AGENTE = 'StreamFlixImporter/1.0 (catalogo personal)';
+
+const PREFIJOS = [
+  'PREFIX wdt: <http://www.wikidata.org/prop/direct/>',
+  'PREFIX wd: <http://www.wikidata.org/entity/>',
+  'PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>',
+  'PREFIX schema: <http://schema.org/>'
+].join('\n');
+
+// De "instancia de" al tipo que entiende el importador.
+const CLASES = {
+  Q11424: 'pelicula', // película
+  Q506240: 'pelicula', // telefilme
+  Q24869: 'pelicula', // largometraje
+  Q5398426: 'serie', // serie de televisión
+  Q1259759: 'serie', // miniserie
+  Q581714: 'serie' // serie de televisión animada
+};
+const CLASES_SPARQL = Object.keys(CLASES).map((q) => `wd:${q}`).join(' ');
+
+async function qlever(sparql) {
+  const url = new URL(QLEVER);
+  url.searchParams.set('query', `${PREFIJOS}\n${sparql}`);
+  const datos = await pedirJson(url, {
+    cabeceras: { 'User-Agent': AGENTE, Accept: 'application/sparql-results+json' }
+  });
+  if (datos.exception) throw new Error(`consulta rechazada: ${datos.exception}`);
+  return datos?.results?.bindings || [];
+}
+
+// Sin esto, un nombre con comillas o llaves se colaría dentro de la consulta.
+function exigirQid(qid) {
+  if (!/^Q\d+$/.test(String(qid))) throw new Error(`identificador de Wikidata no válido: ${qid}`);
+  return qid;
+}
+
+async function resolverEntidad(nombre) {
+  const url = new URL(WIKIDATA_API);
+  url.searchParams.set('action', 'wbsearchentities');
+  url.searchParams.set('search', nombre);
+  url.searchParams.set('language', 'es');
+  url.searchParams.set('uselang', 'es');
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('limit', '5');
+
+  const datos = await pedirJson(url, { cabeceras: { 'User-Agent': AGENTE } });
+  return datos?.search?.[0]?.id || null;
+}
+
+// Todas las consultas devuelven lo mismo, así que el SELECT se escribe una vez
+// y cada intención solo aporta su patrón.
+function consultaDeObras(patron, orden = 'ORDER BY ?anio') {
+  return `SELECT ?obra (SAMPLE(?es) AS ?tEs) (SAMPLE(?wiki) AS ?tWiki) (SAMPLE(?en) AS ?tEn) (MIN(?a) AS ?anio) (SAMPLE(?clase) AS ?tipoObra) WHERE {
+  ${patron}
+  ?obra wdt:P31 ?clase .
+  VALUES ?clase { ${CLASES_SPARQL} }
+  OPTIONAL { ?obra rdfs:label ?es . FILTER(LANG(?es) = "es") }
+  OPTIONAL { ?obra rdfs:label ?en . FILTER(LANG(?en) = "en") }
+  OPTIONAL {
+    ?articulo schema:about ?obra ; schema:isPartOf <https://es.wikipedia.org/> ; schema:name ?wiki .
+  }
+  OPTIONAL { ?obra wdt:P577 ?estreno }
+  OPTIONAL { ?obra wdt:P580 ?inicio }
+  BIND(YEAR(COALESCE(?estreno, ?inicio)) AS ?a)
+} GROUP BY ?obra ${orden}`;
+}
+
+// El nombre del artículo en la Wikipedia española manda sobre la etiqueta
+// "en español" de Wikidata, aunque suene raro: la etiqueta de El padrino II es
+// literalmente "The Godfather Part II", mientras que el artículo se llama
+// "El padrino II", que es como lo busca el importador en sitios en español.
+// Al artículo se le quita el paréntesis desambiguador, que no es del título.
+function deWikidata(fila) {
+  const clase = String(fila?.tipoObra?.value || '').split('/').pop();
+  const wiki = String(fila?.tWiki?.value || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+  return {
+    titulo: wiki || fila?.tEs?.value || fila?.tEn?.value || null,
+    tipo: CLASES[clase] || 'pelicula',
+    anio: Number(fila?.anio?.value) || null,
+    nota: ''
+  };
+}
+
+function ordenarYRecortar(filas, limite) {
+  return filas
+    .map(deWikidata)
+    // Sin fecha de estreno casi siempre es material que nunca salió, y el
+    // importador no lo va a encontrar en ningún sitio.
+    .filter((o) => o.titulo && o.anio)
+    .sort((a, b) => (a.anio || 9999) - (b.anio || 9999))
+    .slice(0, limite);
+}
+
+async function wikiPorPersona(busqueda, rol, limite) {
+  const qid = exigirQid(await resolverEntidad(busqueda));
+  const propiedad = rol === 'actor' ? 'P161' : 'P57';
+  return ordenarYRecortar(await qlever(consultaDeObras(`?obra wdt:${propiedad} wd:${qid} .`)), limite);
+}
+
+// "El Padrino" resuelve a la película de 1972, no a la saga; por eso se sale
+// de la obra hacia su serie y desde ahí se recogen todas las partes.
+async function wikiPorSaga(busqueda, limite) {
+  const qid = exigirQid(await resolverEntidad(busqueda));
+  const porSerie = await qlever(consultaDeObras(`wd:${qid} wdt:P179 ?serie . ?obra wdt:P179 ?serie .`));
+  if (porSerie.length) return ordenarYRecortar(porSerie, limite);
+
+  // Puede que el nombre ya apuntase a la serie en vez de a una de sus partes.
+  return ordenarYRecortar(await qlever(consultaDeObras(`?obra wdt:P179 wd:${qid} .`)), limite);
+}
+
+async function wikiPorEstudio(busqueda, limite) {
+  const qid = exigirQid(await resolverEntidad(busqueda));
+  return ordenarYRecortar(await qlever(consultaDeObras(`?obra wdt:P272 wd:${qid} .`)), limite);
+}
+
+async function wikiPorGenero(busqueda, limite) {
+  const qid = exigirQid(await resolverEntidad(busqueda));
+  return ordenarYRecortar(await qlever(consultaDeObras(`?obra wdt:P136 wd:${qid} .`)), limite);
+}
+
+// Un título suelto no necesita grafo: basta con lo que devuelve la búsqueda.
+async function wikiPorTitulo(busqueda, limite) {
+  const qid = exigirQid(await resolverEntidad(busqueda));
+  return ordenarYRecortar(await qlever(consultaDeObras(`BIND(wd:${qid} AS ?obra)`)), limite);
+}
+
 // ------------------------------------------------------------- despachador
 
 // Devuelve null cuando la fuente no aplica o no está configurada, para que
@@ -242,12 +387,30 @@ async function buscarEnFuentes({ ambito, intencion, busqueda, rol }, limite = 40
     return { fuente: 'AniList', titulos: await animesDeFranquicia(busqueda, limite) };
   }
 
-  if (!hayTmdb()) return null;
+  // TMDB da mejores títulos en español, pero pide registro. Sin clave se usa
+  // Wikidata, que no pide nada y trae la filmografía igual de completa.
+  if (hayTmdb()) {
+    if (intencion === 'persona') return { fuente: 'TMDB', titulos: await porPersona(busqueda, rol, limite) };
+    if (intencion === 'saga') return { fuente: 'TMDB', titulos: await porSaga(busqueda, limite) };
+    if (intencion === 'estudio') return { fuente: 'TMDB', titulos: await porEstudio(busqueda, limite) };
+    return { fuente: 'TMDB', titulos: await porTitulo(busqueda, limite) };
+  }
 
-  if (intencion === 'persona') return { fuente: 'TMDB', titulos: await porPersona(busqueda, rol, limite) };
-  if (intencion === 'saga') return { fuente: 'TMDB', titulos: await porSaga(busqueda, limite) };
-  if (intencion === 'estudio') return { fuente: 'TMDB', titulos: await porEstudio(busqueda, limite) };
-  return { fuente: 'TMDB', titulos: await porTitulo(busqueda, limite) };
+  const fuente = 'Wikidata';
+  if (intencion === 'persona') return { fuente, titulos: await wikiPorPersona(busqueda, rol, limite) };
+  if (intencion === 'saga') return { fuente, titulos: await wikiPorSaga(busqueda, limite) };
+  if (intencion === 'estudio') return { fuente, titulos: await wikiPorEstudio(busqueda, limite) };
+  if (intencion === 'genero') return { fuente, titulos: await wikiPorGenero(busqueda, limite) };
+  return { fuente, titulos: await wikiPorTitulo(busqueda, limite) };
 }
 
-module.exports = { buscarEnFuentes, hayTmdb, animesDeFranquicia, porPersona, porSaga };
+module.exports = {
+  buscarEnFuentes,
+  hayTmdb,
+  animesDeFranquicia,
+  porPersona,
+  porSaga,
+  wikiPorPersona,
+  wikiPorSaga,
+  resolverEntidad
+};

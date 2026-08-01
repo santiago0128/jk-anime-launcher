@@ -24,8 +24,8 @@
 // Variables:
 //   PEDIDO_PROVEEDOR    claude | ollama. Por defecto ollama.
 //   ANTHROPIC_API_KEY   necesaria para el motor claude
-//   TMDB_API_KEY        clave gratuita de themoviedb.org; sin ella el cine cae
-//                       al respaldo del modelo. El anime no necesita nada.
+//   TMDB_API_KEY        opcional. Sin ella el cine sale de Wikidata, que no
+//                       pide nada; con ella, de TMDB, que da mejores títulos.
 //   OLLAMA_URL          por defecto http://host.docker.internal:11434
 //   OLLAMA_MODELO       por defecto qwen2.5:1.5b
 //   PEDIDO_MAX_TITULOS  tope de títulos por pedido (por defecto 40)
@@ -34,7 +34,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
-const { buscarEnFuentes, hayTmdb } = require('./fuentes_catalogo.js');
+const { buscarEnFuentes } = require('./fuentes_catalogo.js');
 
 const raizStreamflix = process.env.STREAMFLIX_ROOT;
 if (raizStreamflix && fs.existsSync(path.join(raizStreamflix, '.env'))) {
@@ -410,15 +410,7 @@ async function expandirPedido(pedido) {
     }
   }
 
-  const respaldo = await listarConElModelo(texto);
-  if (!respaldo.titulos.length) return respaldo;
-
-  // Cuando el ámbito era cine y no hay clave de TMDB, la lista viene del
-  // modelo: conviene decir por qué es peor de lo que podría ser.
-  if (intencion && intencion.ambito === 'cine' && !hayTmdb()) {
-    respaldo.falta = 'TMDB_API_KEY';
-  }
-  return respaldo;
+  return listarConElModelo(texto);
 }
 
 function describirIntencion({ ambito, intencion, busqueda, rol }) {

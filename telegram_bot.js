@@ -363,13 +363,7 @@ async function atender(mensaje) {
     // da la filmografía entera, un modelo de memoria se deja títulos.
     const firma = propuesta.exacta
       ? `<i>datos de ${escaparHtml(propuesta.fuente)} — lista completa</i>`
-      : [
-          `⚠️ <i>lista armada por ${escaparHtml(propuesta.fuente)} de memoria: repásala antes de /ok,`,
-          'se deja títulos fuera y de vez en cuando se inventa alguno.</i>',
-          propuesta.falta === 'TMDB_API_KEY'
-            ? '\n💡 <i>Con una clave gratuita de TMDB en el .env esto saldría completo y exacto.</i>'
-            : ''
-        ].join(' ');
+      : `⚠️ <i>lista armada por ${escaparHtml(propuesta.fuente)} de memoria: repásala antes de /ok, se deja títulos fuera y de vez en cuando se inventa alguno.</i>`;
 
     return responder(chatId, [
       `<b>${propuesta.titulos.length} títulos</b> para «${escaparHtml(argumento)}»`,
