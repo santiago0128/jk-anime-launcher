@@ -490,9 +490,15 @@ function normalizeForMatch(value) {
 }
 
 function meaningfulWords(value) {
-  return normalizeForMatch(value)
+  const words = normalizeForMatch(value)
     .split(' ')
     .filter((word) => word && !MATCH_STOPWORDS.has(word));
+
+  // Los buscadores devuelven el año pegado al titulo ("Chernobyl (2019)"), y
+  // contarlo como una palabra mas hundia el parecido de un titulo idéntico.
+  // Se conserva si es lo unico que hay, que es el caso de peliculas como "1917".
+  const withoutYear = words.filter((word) => !/^(?:19|20)\d{2}$/.test(word));
+  return withoutYear.length ? withoutYear : words;
 }
 
 // Coeficiente de Dice sobre bigramas: tolera erratas y letras de mas o de menos
