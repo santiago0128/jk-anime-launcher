@@ -666,34 +666,71 @@ async function main() {
     });
 
     const iniciado = new Date().toISOString();
-    const result = await importPelisplus({
-      pageUrl: targetUrl,
-      baseUrl: match?.baseUrl || PELISPLUS_HOME_URL,
-      contentType,
-      season: args.season,
-      start: args.start,
-      end: args.end,
-      emitJson: false,
-      onProgress: (event) => {
-        process.stderr.write(
-          `→ T${event.seasonNumber}E${event.episodeNumber} (${event.provider})${
-            event.total ? ` [${event.done}/${event.total}]` : ''
-          }\n`
-        );
-        escribirProgreso({
-          estado: 'importando',
-          tipo: label,
-          titulo: nombreMostrado,
-          hechos: event.done || 0,
-          total: event.total || null,
-          ultimo: `T${event.seasonNumber}E${event.episodeNumber}`,
-          iniciado
-        });
+
+    // Que un sitio publique la ficha no quiere decir que tenga video. Cuando
+    // se queda sin reproductor se prueba el siguiente sitio con la misma
+    // pelicula, en vez de dar el titulo por perdido.
+    const sinVideo = (error) => /no expone ningun reproductor/i.test(error?.message || '');
+    // Sin coincidencia del buscador se arma la URL a mano, y entonces hay que
+    // armarla para todos los sitios: cuando el buscador de uno deja de
+    // funcionar, esta es la unica via que queda para llegar al otro.
+    const porUrlDirecta = () =>
+      CONTENT_SITES.map((baseUrl) => ({ url: buildTitleUrl({ baseUrl, contentType, title: titleArg }), baseUrl })).filter(
+        (item) => item.url
+      );
+
+    let candidatos;
+    if (pageUrlArg) {
+      candidatos = [{ url: pageUrlArg, baseUrl: match?.baseUrl || PELISPLUS_HOME_URL }];
+    } else if (match?.url) {
+      candidatos = [{ url: match.url, baseUrl: match.baseUrl }, ...(match.alternativas || [])];
+    } else {
+      candidatos = porUrlDirecta();
+    }
+    if (!candidatos.length) candidatos = [{ url: targetUrl, baseUrl: PELISPLUS_HOME_URL }];
+
+    const importarDesde = (candidato) =>
+      importPelisplus({
+        pageUrl: candidato.url,
+        baseUrl: candidato.baseUrl,
+        contentType,
+        season: args.season,
+        start: args.start,
+        end: args.end,
+        emitJson: false,
+        onProgress: (event) => {
+          process.stderr.write(
+            `→ T${event.seasonNumber}E${event.episodeNumber} (${event.provider})${
+              event.total ? ` [${event.done}/${event.total}]` : ''
+            }\n`
+          );
+          escribirProgreso({
+            estado: 'importando',
+            tipo: label,
+            titulo: nombreMostrado,
+            hechos: event.done || 0,
+            total: event.total || null,
+            ultimo: `T${event.seasonNumber}E${event.episodeNumber}`,
+            iniciado
+          });
+        }
+      });
+
+    let result = null;
+    for (const [indice, candidato] of candidatos.entries()) {
+      const ultimo = indice === candidatos.length - 1;
+      try {
+        result = await importarDesde(candidato);
+        break;
+      } catch (error) {
+        if (sinVideo(error) && !ultimo) {
+          process.stderr.write(`· ${candidato.baseUrl} no tiene video para "${nombreMostrado}", pruebo el siguiente sitio\n`);
+          continue;
+        }
+        escribirProgreso({ estado: 'error', tipo: label, titulo: nombreMostrado, motivo: error.message, iniciado });
+        throw error;
       }
-    }).catch((error) => {
-      escribirProgreso({ estado: 'error', tipo: label, titulo: nombreMostrado, motivo: error.message, iniciado });
-      throw error;
-    });
+    }
 
     escribirProgreso({
       estado: 'terminado',

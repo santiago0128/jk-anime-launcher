@@ -667,14 +667,21 @@ async function searchTitle({ baseUrl, contentType, title, minScore = MIN_MATCH_S
 // tenga el titulo exacto, y se prefiere ese.
 async function searchTitleAcrossSites({ contentType, title, baseUrls }) {
   const attempts = [];
+  const fuertes = [];
   let bestSoFar = null;
 
   for (const baseUrl of baseUrls) {
     try {
       const match = await searchTitle({ baseUrl, contentType, title });
 
+      // Antes se devolvia el primer acierto y no se miraban los demas sitios.
+      // Pero que un sitio tenga la ficha no quiere decir que tenga video: hay
+      // paginas publicadas sin ningun reproductor, y entonces la importacion
+      // moria ahi en vez de probar el sitio siguiente. Se recogen todos para
+      // que quien importa pueda ir bajando por la lista.
       if (isStrongMatch(match)) {
-        return { ...match, baseUrl, strong: true, attempts };
+        fuertes.push({ ...match, baseUrl, strong: true });
+        continue;
       }
 
       if (match) {
@@ -690,11 +697,15 @@ async function searchTitleAcrossSites({ contentType, title, baseUrls }) {
     }
   }
 
-  if (bestSoFar) {
-    return { ...bestSoFar, attempts };
+  if (fuertes.length) {
+    return { ...fuertes[0], alternativas: fuertes.slice(1), attempts };
   }
 
-  return { attempts };
+  if (bestSoFar) {
+    return { ...bestSoFar, alternativas: [], attempts };
+  }
+
+  return { attempts, alternativas: [] };
 }
 
 function lastPathSegment(path) {
