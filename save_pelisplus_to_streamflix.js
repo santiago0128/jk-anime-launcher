@@ -477,7 +477,20 @@ const CUEVANA3_ADAPTER = {
 };
 
 // Palabras que no aportan a la identidad del titulo y estorban al comparar.
-const MATCH_STOPWORDS = new Set(['el', 'la', 'los', 'las', 'un', 'una', 'de', 'del', 'y', 'the', 'a', 'an', 'of', 'and']);
+const MATCH_STOPWORDS = new Set([
+  'el', 'la', 'los', 'las', 'un', 'una', 'de', 'del', 'y', 'the', 'a', 'an', 'of', 'and',
+  // Una secuela se numera de mil maneras: "El padrino II" en una fuente y
+  // "El Padrino. Parte II" en el buscador son la misma pelicula.
+  'parte', 'part', 'capitulo', 'chapter'
+]);
+
+// Los numeros romanos de las secuelas se pasan a cifras para que "II" y "2"
+// cuenten como la misma palabra. Se deja fuera la "i" suelta a proposito: en
+// ingles es un pronombre ("I Am Legend") y convertirla estropearia el titulo.
+const ROMANOS = {
+  ii: '2', iii: '3', iv: '4', v: '5', vi: '6', vii: '7', viii: '8', ix: '9', x: '10',
+  xi: '11', xii: '12', xiii: '13', xiv: '14', xv: '15'
+};
 
 function normalizeForMatch(value) {
   return String(value || '')
@@ -492,13 +505,26 @@ function normalizeForMatch(value) {
 function meaningfulWords(value) {
   const words = normalizeForMatch(value)
     .split(' ')
-    .filter((word) => word && !MATCH_STOPWORDS.has(word));
+    .filter((word) => word && !MATCH_STOPWORDS.has(word))
+    .map((word) => ROMANOS[word] || word);
 
   // Los buscadores devuelven el año pegado al titulo ("Chernobyl (2019)"), y
   // contarlo como una palabra mas hundia el parecido de un titulo idéntico.
   // Se conserva si es lo unico que hay, que es el caso de peliculas como "1917".
   const withoutYear = words.filter((word) => !/^(?:19|20)\d{2}$/.test(word));
   return withoutYear.length ? withoutYear : words;
+}
+
+// El numero de secuela decide la identidad de la pelicula, y al comparar pesa
+// muy poco: "padrino 2" y "padrino" se parecen mucho como texto, pero son
+// peliculas distintas. Se mira aparte para poder vetar el emparejamiento.
+// Solo cuenta como numero de secuela si va al final y es pequeño: asi "85" de
+// "Stranger Things: Relatos del 85" no se confunde con una segunda parte.
+function numeroDeSecuela(words) {
+  const ultima = words[words.length - 1];
+  if (!/^\d{1,2}$/.test(ultima || '')) return null;
+  const n = Number(ultima);
+  return n >= 2 && n <= 30 ? n : null;
 }
 
 // Coeficiente de Dice sobre bigramas: tolera erratas y letras de mas o de menos
@@ -567,10 +593,23 @@ function scoreCandidate(query, candidate) {
 
   const textual = Math.max(
     diceSimilarity(query, candidate.title),
-    diceSimilarity(query, lastPathSegment(candidate.path).replace(/-/g, ' '))
+    diceSimilarity(query, lastPathSegment(candidate.path).replace(/-/g, ' ')),
+    // Tambien en su forma canonica: comparar los textos crudos penaliza a un
+    // candidato que solo trae el año pegado o la palabra "Parte".
+    diceSimilarity(queryWords.join(' '), candidateWords.join(' '))
   );
 
-  return overlap * 0.6 + textual * 0.4;
+  const puntuacion = overlap * 0.6 + textual * 0.4;
+
+  // Si una parte lleva numero de secuela y la otra lleva otro (o ninguno), no
+  // son la misma pelicula por mucho que el titulo se parezca. Se deja en la
+  // franja de "parecido pero hay que confirmarlo" en vez de descartarlo, para
+  // que el buscador pueda seguir enseñandolo como lo mas cercano.
+  if (numeroDeSecuela(queryWords) !== numeroDeSecuela(candidateWords)) {
+    return Math.min(puntuacion, 0.7);
+  }
+
+  return puntuacion;
 }
 
 // Por debajo de esto ni se considera; entre ambos es "parecido pero no seguro" y
@@ -1657,6 +1696,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  scoreCandidate,
   main,
   searchTitle,
   searchTitleAcrossSites,
