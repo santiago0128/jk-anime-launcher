@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const https = require('https');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
@@ -49,6 +50,22 @@ function parseArgs(argv) {
 function shouldOpenBrowser(args) {
   if (process.env.JK_NO_BROWSER === '1') return false;
   return args['no-browser'] !== 'true' && args['no-browser'] !== true;
+}
+
+// Estado de la importación en curso, en un archivo que cualquiera puede leer.
+// Lo escribe el importador venga de donde venga (bot, cron o script), que es
+// como el bot de Telegram puede informar del avance sin haberla lanzado él.
+const ARCHIVO_PROGRESO = process.env.STREAMFLIX_PROGRESS_FILE || '/tmp/streamflix-progreso.json';
+
+function escribirProgreso(datos) {
+  try {
+    fs.writeFileSync(
+      ARCHIVO_PROGRESO,
+      JSON.stringify({ ...datos, actualizado: new Date().toISOString() }, null, 2)
+    );
+  } catch {
+    // El progreso es informativo: si no se puede escribir, la importación sigue.
+  }
 }
 
 function fetchText(url, options = {}, redirectCount = 0) {
@@ -516,6 +533,17 @@ async function main() {
     const targetUrl = pageUrlArg || match?.url || getBrowserTargetUrl(contentType, null, titleArg);
     if (shouldOpenBrowser(args)) openUrlInBrowser(targetUrl);
 
+    const nombreMostrado = match?.title || titleArg || targetUrl;
+    escribirProgreso({
+      estado: 'importando',
+      tipo: label,
+      titulo: nombreMostrado,
+      hechos: 0,
+      total: null,
+      iniciado: new Date().toISOString()
+    });
+
+    const iniciado = new Date().toISOString();
     const result = await importPelisplus({
       pageUrl: targetUrl,
       baseUrl: match?.baseUrl || PELISPLUS_HOME_URL,
@@ -524,12 +552,35 @@ async function main() {
       start: args.start,
       end: args.end,
       emitJson: false,
-      onProgress: (event) =>
+      onProgress: (event) => {
         process.stderr.write(
           `→ T${event.seasonNumber}E${event.episodeNumber} (${event.provider})${
             event.total ? ` [${event.done}/${event.total}]` : ''
           }\n`
-        )
+        );
+        escribirProgreso({
+          estado: 'importando',
+          tipo: label,
+          titulo: nombreMostrado,
+          hechos: event.done || 0,
+          total: event.total || null,
+          ultimo: `T${event.seasonNumber}E${event.episodeNumber}`,
+          iniciado
+        });
+      }
+    }).catch((error) => {
+      escribirProgreso({ estado: 'error', tipo: label, titulo: nombreMostrado, motivo: error.message, iniciado });
+      throw error;
+    });
+
+    escribirProgreso({
+      estado: 'terminado',
+      tipo: label,
+      titulo: result.title || nombreMostrado,
+      hechos: result.importedCount,
+      total: result.importedCount,
+      saltados: result.skippedCount,
+      iniciado
     });
 
     console.log(
@@ -608,6 +659,16 @@ async function main() {
   const imported = [];
   const failed = [];
   const total = end - start + 1;
+  const iniciado = new Date().toISOString();
+
+  escribirProgreso({
+    estado: 'importando',
+    tipo: 'anime',
+    titulo: config.seriesName,
+    hechos: 0,
+    total,
+    iniciado
+  });
 
   for (let episodeNumber = start; episodeNumber <= end; episodeNumber += 1) {
     // Un capitulo caido no puede llevarse por delante el resto de la serie.
@@ -628,7 +689,28 @@ async function main() {
         `✗ capítulo ${episodeNumber} [${imported.length + failed.length}/${total}]: ${error.message || error}\n`
       );
     }
+
+    escribirProgreso({
+      estado: 'importando',
+      tipo: 'anime',
+      titulo: config.seriesName,
+      hechos: imported.length + failed.length,
+      total,
+      fallidos: failed.length,
+      ultimo: `capítulo ${episodeNumber}`,
+      iniciado
+    });
   }
+
+  escribirProgreso({
+    estado: imported.length ? 'terminado' : 'error',
+    tipo: 'anime',
+    titulo: config.seriesName,
+    hechos: imported.length,
+    total,
+    fallidos: failed.length,
+    iniciado
+  });
 
   if (!imported.length) {
     throw new Error(

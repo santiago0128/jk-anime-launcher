@@ -44,7 +44,8 @@ const AYUDA = [
   '/anime Dragon Ball Z',
   '',
   '<b>Consultar</b>',
-  '/estado — qué hay en el catálogo',
+  '/estado — cómo va la importación en curso',
+  '/catalogo — qué hay guardado',
   '/revisar — busca enlaces caducados',
   '/ayuda'
 ].join('\n');
@@ -52,6 +53,94 @@ const AYUDA = [
 // Una importación a la vez: son decenas de descargas y lanzar varias en
 // paralelo solo consigue que el sitio de origen empiece a rechazar.
 let ocupado = null;
+
+// El importador deja aquí por dónde va, venga de donde venga: del bot, del
+// cron o de un script suelto. Por eso /estado puede informar de una carga que
+// el bot no lanzó, y por eso puede avisar cuando esa carga termina.
+const ARCHIVO_PROGRESO = process.env.STREAMFLIX_PROGRESS_FILE || '/tmp/streamflix-progreso.json';
+
+function leerProgreso() {
+  try {
+    return JSON.parse(fs.readFileSync(ARCHIVO_PROGRESO, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function formatearDuracion(segundos) {
+  if (!isFinite(segundos) || segundos < 0) return '—';
+  const h = Math.floor(segundos / 3600);
+  const m = Math.floor((segundos % 3600) / 60);
+  if (h) return `${h} h ${m} min`;
+  if (m) return `${m} min`;
+  return `${Math.round(segundos)} s`;
+}
+
+function describirProgreso(p) {
+  if (!p) return 'No hay ninguna importación registrada todavía.\n\n/catalogo para ver lo que hay guardado.';
+
+  const inicio = p.iniciado ? new Date(p.iniciado).getTime() : null;
+  const transcurrido = inicio ? (Date.now() - inicio) / 1000 : null;
+
+  if (p.estado === 'importando') {
+    const lineas = [`⏳ <b>${p.titulo}</b> (${p.tipo})`];
+
+    if (p.total) {
+      const pct = Math.round((p.hechos / p.total) * 100);
+      const barra = '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5));
+      lineas.push(`<code>${barra}</code> ${pct}%`);
+      lineas.push(`${p.hechos} de ${p.total} capítulos`);
+
+      // El tiempo restante se calcula con el ritmo real de esta carga, que
+      // depende de cuántos servidores haya que probar por capítulo.
+      if (transcurrido && p.hechos > 0) {
+        const ritmo = p.hechos / transcurrido;
+        lineas.push(`Faltan ~${formatearDuracion((p.total - p.hechos) / ritmo)}`);
+      }
+    } else {
+      lineas.push(`${p.hechos || 0} capítulos hasta ahora`);
+    }
+
+    if (transcurrido) lineas.push(`Lleva ${formatearDuracion(transcurrido)}`);
+    if (p.fallidos) lineas.push(`${p.fallidos} fallidos`);
+    return lineas.join('\n');
+  }
+
+  if (p.estado === 'terminado') {
+    const partes = [`✅ <b>${p.titulo}</b> (${p.tipo})`, `${p.hechos} capítulos importados`];
+    if (p.saltados) partes.push(`${p.saltados} sin video disponible`);
+    if (p.fallidos) partes.push(`${p.fallidos} fallidos`);
+    if (transcurrido) partes.push(`Tardó ${formatearDuracion(transcurrido)}`);
+    partes.push('', 'Última importación terminada. /catalogo para ver el total.');
+    return partes.join('\n');
+  }
+
+  return `❌ <b>${p.titulo || 'importación'}</b>\n${p.motivo || 'terminó con error'}`;
+}
+
+// Vigila el archivo de progreso para avisar cuando una carga termina, aunque
+// la haya lanzado el cron o un script y no el bot.
+function vigilarProgreso() {
+  let anterior = leerProgreso()?.estado || null;
+  let anteriorTitulo = leerProgreso()?.titulo || null;
+
+  setInterval(() => {
+    const actual = leerProgreso();
+    if (!actual) return;
+
+    const cambio = actual.estado !== anterior || actual.titulo !== anteriorTitulo;
+    const acabaDeTerminar = cambio && (actual.estado === 'terminado' || actual.estado === 'error');
+
+    // Si la lanzó el bot, ya responde él con el resultado; este aviso es para
+    // las que corren por su cuenta.
+    if (acabaDeTerminar && !ocupado) {
+      enviarMensaje(describirProgreso(actual)).catch((e) => console.error(e.message));
+    }
+
+    anterior = actual.estado;
+    anteriorTitulo = actual.titulo;
+  }, 15000);
+}
 
 function pedirTelegram(metodo, parametros) {
   const url = `https://api.telegram.org/bot${TOKEN}/${metodo}?${new URLSearchParams(parametros)}`;
@@ -135,6 +224,10 @@ async function atender(mensaje) {
   }
 
   if (comando === '/estado') {
+    return responder(chatId, describirProgreso(leerProgreso()));
+  }
+
+  if (comando === '/catalogo') {
     const salida = await ejecutarScript('resumen_catalogo.js', [], chatId);
     return responder(chatId, `<b>Catálogo</b>\n<pre>${salida.trim().slice(0, 3000)}</pre>`);
   }
@@ -185,4 +278,5 @@ async function escuchar() {
   }
 }
 
+vigilarProgreso();
 escuchar();
