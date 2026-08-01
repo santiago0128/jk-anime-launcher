@@ -341,7 +341,7 @@ async function atender(mensaje) {
     }
     if (ocupado) return responder(chatId, `⏳ Ya hay algo en curso: ${escaparHtml(ocupado)}. Espera a que termine.`);
 
-    await responder(chatId, '🤔 Le pregunto a Claude qué títulos son…');
+    await responder(chatId, '🤔 Pensando qué títulos son…');
 
     let propuesta;
     ocupado = 'consultando a Claude';
@@ -359,13 +359,21 @@ async function atender(mensaje) {
 
     pendiente = { pedido: argumento, titulos: propuesta.titulos, creado: Date.now() };
 
+    // Se dice qué modelo la armó porque explica la calidad de la lista: el
+    // modelo local del servidor se deja títulos fuera y se inventa los años.
+    const firma =
+      propuesta.proveedor === 'ollama'
+        ? `<i>vía ${escaparHtml(propuesta.modelo)} (local) — puede dejarse títulos; añádelos con /serie, /pelicula o /anime</i>`
+        : `<i>vía ${escaparHtml(propuesta.modelo)}</i>`;
+
     return responder(chatId, [
       `<b>${propuesta.titulos.length} títulos</b> para «${escaparHtml(argumento)}»`,
       propuesta.interpretacion ? `<i>${escaparHtml(propuesta.interpretacion)}</i>` : '',
       '',
       describirLista(propuesta),
       '',
-      '/ok para importarlos todos · /no para descartar'
+      '/ok para importarlos todos · /no para descartar',
+      firma
     ].filter(Boolean).join('\n'));
   }
 

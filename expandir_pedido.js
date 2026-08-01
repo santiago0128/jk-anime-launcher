@@ -3,18 +3,29 @@
 // Traduce un pedido en lenguaje natural a una lista concreta de títulos.
 //
 // El importador necesita un nombre exacto por título; una persona escribe
-// "todas las de Marvel". Este módulo cubre esa distancia preguntándole a
-// Claude, que devuelve la lista ya clasificada en anime / serie / película.
+// "todas las de Marvel". Este módulo cubre esa distancia preguntándole a un
+// modelo, que devuelve la lista ya clasificada en anime / serie / película.
+//
+// Sirven dos motores y la diferencia se nota:
+//   claude  la API de Anthropic. Listas completas; cuesta céntimos por pedido.
+//   ollama  el que ya corre en el servidor. Gratis, pero un modelo pequeño se
+//           deja títulos fuera y se inventa los años.
 //
 // Uso desde consola (imprime JSON):
 //   node expandir_pedido.js "la trilogia original de star wars"
 //
 // Variables:
-//   ANTHROPIC_API_KEY   obligatoria, en el .env de StreamFlix
+//   PEDIDO_PROVEEDOR    claude | ollama. Si no se pone, usa claude cuando hay
+//                       clave y ollama en caso contrario.
+//   ANTHROPIC_API_KEY   necesaria para el motor claude
+//   OLLAMA_URL          por defecto http://host.docker.internal:11434
+//   OLLAMA_MODELO       por defecto qwen2.5:1.5b
 //   PEDIDO_MAX_TITULOS  tope de títulos por pedido (por defecto 40)
 
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 
 const raizStreamflix = process.env.STREAMFLIX_ROOT;
 if (raizStreamflix && fs.existsSync(path.join(raizStreamflix, '.env'))) {
@@ -24,6 +35,9 @@ if (raizStreamflix && fs.existsSync(path.join(raizStreamflix, '.env'))) {
 const MODELO = 'claude-opus-5';
 const TIPOS = ['anime', 'serie', 'pelicula'];
 const MAX_TITULOS = Number(process.env.PEDIDO_MAX_TITULOS) || 40;
+
+const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://host.docker.internal:11434').replace(/\/+$/, '');
+const OLLAMA_MODELO = process.env.OLLAMA_MODELO || 'qwen2.5:1.5b';
 
 // El esquema obliga a que la respuesta venga ya parseable: sin él Claude
 // contesta en prosa y habría que adivinar dónde empieza cada título.
@@ -99,7 +113,8 @@ function crearCliente() {
 // Los reintentos ante una negativa se piden con una beta; si la cuenta o el
 // SDK todavía no la tienen, la API responde 400 y se repite sin ella en vez de
 // dejar el comando inservible.
-async function pedirAClaude(client, mensaje) {
+async function pedirAClaude(mensaje) {
+  const client = crearCliente();
   const base = {
     model: MODELO,
     max_tokens: 16000,
@@ -108,16 +123,105 @@ async function pedirAClaude(client, mensaje) {
     messages: [{ role: 'user', content: mensaje }]
   };
 
+  let respuesta;
   try {
-    return await client.beta.messages.create({
+    respuesta = await client.beta.messages.create({
       ...base,
       betas: ['server-side-fallback-2026-07-01'],
       fallbacks: 'default'
     });
   } catch (error) {
     if (error?.status !== 400) throw error;
-    return client.messages.create(base);
+    respuesta = await client.messages.create(base);
   }
+
+  // Los clasificadores pueden rechazar una petición: llega un 200 con el
+  // contenido vacío, así que hay que mirar stop_reason antes que content.
+  if (respuesta.stop_reason === 'refusal') {
+    throw new Error('Claude declinó responder a ese pedido');
+  }
+
+  const bloque = (respuesta.content || []).find((b) => b.type === 'text');
+  if (!bloque) throw new Error('Claude no devolvió ninguna lista');
+  return bloque.text;
+}
+
+// Ollama no lleva SDK propio aquí: es una petición HTTP y así el módulo se
+// carga igual en un Node sin fetch global.
+function pedirAOllama(mensaje) {
+  const cuerpo = JSON.stringify({
+    model: OLLAMA_MODELO,
+    stream: false,
+    format: ESQUEMA,
+    options: { temperature: 0 },
+    messages: [
+      { role: 'system', content: INSTRUCCIONES },
+      { role: 'user', content: mensaje }
+    ]
+  });
+
+  const url = new URL(`${OLLAMA_URL}/api/chat`);
+  const cliente = url.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const peticion = cliente.request(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(cuerpo) },
+        // En CPU y con una lista larga puede tardar minutos.
+        timeout: 300000
+      },
+      (respuesta) => {
+        let datos = '';
+        respuesta.on('data', (c) => (datos += c));
+        respuesta.on('end', () => {
+          let json;
+          try {
+            json = JSON.parse(datos);
+          } catch {
+            return reject(new Error(`Ollama respondió algo ilegible: ${datos.slice(0, 200)}`));
+          }
+          if (json.error) {
+            // Los modelos ":cloud" corren en los servidores de Ollama y piden
+            // sesión iniciada; los locales no.
+            const pista = /unauthorized/i.test(json.error)
+              ? ` (¿es un modelo ":cloud"? necesita "ollama signin" en el servidor)`
+              : '';
+            return reject(new Error(`Ollama: ${json.error}${pista}`));
+          }
+          const texto = json?.message?.content;
+          if (!texto) return reject(new Error('Ollama no devolvió ninguna lista'));
+          resolve(texto);
+        });
+      }
+    );
+
+    peticion.on('timeout', () => peticion.destroy(new Error('Ollama tardó demasiado')));
+    peticion.on('error', (error) =>
+      reject(new Error(`No pude hablar con Ollama en ${OLLAMA_URL}: ${error.message}`))
+    );
+    peticion.end(cuerpo);
+  });
+}
+
+// Sin configurar nada se usa lo que haya: la clave si está, y si no el Ollama
+// del servidor. Así el comando funciona desde el primer momento.
+function elegirProveedor() {
+  const pedido = String(process.env.PEDIDO_PROVEEDOR || '').trim().toLowerCase();
+  if (pedido === 'claude' || pedido === 'ollama') return pedido;
+  if (pedido) throw new Error(`PEDIDO_PROVEEDOR solo acepta "claude" u "ollama", no "${pedido}"`);
+  return process.env.ANTHROPIC_API_KEY ? 'claude' : 'ollama';
+}
+
+// Un modelo pequeño a veces envuelve el JSON en texto pese al esquema.
+function extraerJson(texto) {
+  const limpio = String(texto).trim();
+  if (limpio.startsWith('{')) return limpio;
+  const inicio = limpio.indexOf('{');
+  const fin = limpio.lastIndexOf('}');
+  if (inicio < 0 || fin <= inicio) throw new Error('La respuesta no traía ningún JSON');
+  return limpio.slice(inicio, fin + 1);
 }
 
 function normalizar(datos) {
@@ -145,28 +249,24 @@ async function expandirPedido(pedido) {
   const texto = String(pedido || '').trim();
   if (!texto) throw new Error('El pedido está vacío');
 
-  const respuesta = await pedirAClaude(crearCliente(), texto);
-
-  // Los clasificadores pueden rechazar una petición: llega un 200 con el
-  // contenido vacío, así que hay que mirar stop_reason antes que content.
-  if (respuesta.stop_reason === 'refusal') {
-    throw new Error('Claude declinó responder a ese pedido');
-  }
-
-  const bloque = (respuesta.content || []).find((b) => b.type === 'text');
-  if (!bloque) throw new Error('Claude no devolvió ninguna lista');
+  const proveedor = elegirProveedor();
+  const crudo = proveedor === 'ollama' ? await pedirAOllama(texto) : await pedirAClaude(texto);
 
   let datos;
   try {
-    datos = JSON.parse(bloque.text);
+    datos = JSON.parse(extraerJson(crudo));
   } catch {
-    throw new Error('La respuesta de Claude no vino en el formato esperado');
+    throw new Error(`La respuesta de ${proveedor} no vino en el formato esperado`);
   }
 
-  return normalizar(datos);
+  return {
+    ...normalizar(datos),
+    proveedor,
+    modelo: proveedor === 'ollama' ? OLLAMA_MODELO : MODELO
+  };
 }
 
-module.exports = { expandirPedido, MAX_TITULOS, TIPOS };
+module.exports = { expandirPedido, elegirProveedor, MAX_TITULOS, TIPOS };
 
 if (require.main === module) {
   const pedido = process.argv.slice(2).join(' ');
