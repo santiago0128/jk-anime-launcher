@@ -8,9 +8,9 @@
 //
 // Sirven dos motores y la diferencia se nota:
 //   claude  la API de Anthropic. Listas completas; cuesta céntimos por pedido.
-//   ollama  el que ya corre en el servidor. Gratis, pero con un modelo pequeño
-//           se inventa títulos que no existen y confunde series con películas,
-//           así que hay que repasar la lista antes de importarla.
+//   ollama  el que ya corre en el servidor. Gratis, pero un modelo pequeño da
+//           listas cortas y de vez en cuando se inventa un título, así que hay
+//           que repasarlas antes de importar.
 //
 // Uso desde consola (imprime JSON):
 //   node expandir_pedido.js "la trilogia original de star wars"
