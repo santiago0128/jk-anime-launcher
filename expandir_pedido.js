@@ -3,22 +3,29 @@
 // Traduce un pedido en lenguaje natural a una lista concreta de títulos.
 //
 // El importador necesita un nombre exacto por título; una persona escribe
-// "todas las de Marvel". Este módulo cubre esa distancia preguntándole a un
-// modelo, que devuelve la lista ya clasificada en anime / serie / película.
+// "todas las de Marvel". Este módulo cubre esa distancia en dos pasos, y el
+// reparto importa:
 //
-// Sirven dos motores y la diferencia se nota:
-//   claude  la API de Anthropic. Listas completas; cuesta céntimos por pedido.
-//   ollama  el que ya corre en el servidor. Gratis, pero un modelo pequeño da
-//           listas cortas y de vez en cuando se inventa un título, así que hay
-//           que repasarlas antes de importar.
+//   1. Un modelo interpreta el pedido: "todas las de Nolan" -> persona,
+//      Christopher Nolan, director. Eso lo hace bien hasta un modelo pequeño.
+//   2. Los títulos los pone una base de datos de cine (ver fuentes_catalogo).
+//
+// Hacerlo al revés —pedirle la lista al modelo— es lo que devolvía "El
+// Padrino: El Segundo Sol", que no existe. Ese camino sigue ahí como respaldo
+// para cuando ninguna fuente sabe responder, pero ya no es el principal.
+//
+// Motores para el paso 1:
+//   ollama  el del servidor. Gratis, y para interpretar sobra. Es el de serie.
+//   claude  la API de Anthropic. Solo si se pide, o si Ollama no responde.
 //
 // Uso desde consola (imprime JSON):
 //   node expandir_pedido.js "la trilogia original de star wars"
 //
 // Variables:
-//   PEDIDO_PROVEEDOR    claude | ollama. Si no se pone, usa claude cuando hay
-//                       clave; ollama nunca se elige solo.
+//   PEDIDO_PROVEEDOR    claude | ollama. Por defecto ollama.
 //   ANTHROPIC_API_KEY   necesaria para el motor claude
+//   TMDB_API_KEY        clave gratuita de themoviedb.org; sin ella el cine cae
+//                       al respaldo del modelo. El anime no necesita nada.
 //   OLLAMA_URL          por defecto http://host.docker.internal:11434
 //   OLLAMA_MODELO       por defecto qwen2.5:1.5b
 //   PEDIDO_MAX_TITULOS  tope de títulos por pedido (por defecto 40)
@@ -27,6 +34,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const { buscarEnFuentes, hayTmdb } = require('./fuentes_catalogo.js');
 
 const raizStreamflix = process.env.STREAMFLIX_ROOT;
 if (raizStreamflix && fs.existsSync(path.join(raizStreamflix, '.env'))) {
@@ -98,8 +106,6 @@ const INSTRUCCIONES = [
   '  relevantes y dilo en "interpretacion".'
 ].join('\n');
 
-// El SDK se carga aquí y no arriba para que el bot arranque igual aunque esta
-// dependencia falte: el resto de comandos no la necesitan.
 // Las instrucciones de arriba están escritas para un modelo grande y a uno
 // pequeño lo ahogan: con ellas, qwen2.5:1.5b se agarraba a la regla del pedido
 // ambiguo y devolvía la lista vacía hasta para "la trilogía de El Padrino".
@@ -121,6 +127,46 @@ const INSTRUCCIONES_CORTAS = [
   '- En interpretacion, una frase corta con lo que entendiste.'
 ].join('\n');
 
+// Interpretar el pedido es lo único que se le pide al modelo cuando hay una
+// fuente de datos detrás: de "todas las de Nolan" solo hay que sacar que se
+// habla de una persona llamada Christopher Nolan. Eso sí lo hace bien un
+// modelo pequeño, y es gratis.
+const ESQUEMA_INTENCION = {
+  type: 'object',
+  properties: {
+    ambito: { type: 'string', enum: ['anime', 'cine'], description: 'anime para animación japonesa; cine para todo lo demás.' },
+    intencion: {
+      type: 'string',
+      enum: ['persona', 'saga', 'estudio', 'genero', 'titulo'],
+      description: 'Qué clase de pedido es.'
+    },
+    busqueda: { type: 'string', description: 'El nombre a buscar, sin adornos: "Christopher Nolan", "El Padrino", "Ghibli".' },
+    rol: { type: 'string', enum: ['director', 'actor', ''], description: 'Solo si intencion es persona.' }
+  },
+  required: ['ambito', 'intencion', 'busqueda', 'rol'],
+  additionalProperties: false
+};
+
+const INSTRUCCIONES_INTENCION = [
+  'Clasificas un pedido de películas, series o anime. No listas títulos: solo dices qué se está pidiendo.',
+  '',
+  'ambito: "anime" si habla de animación japonesa; "cine" para lo demás.',
+  'intencion:',
+  '  persona  — se pide la obra de alguien ("las de Nolan", "películas de Tom Hanks")',
+  '  saga     — se pide una saga o trilogía ("la trilogía de El Padrino", "todo Star Wars")',
+  '  estudio  — se pide lo de una productora o estudio ("lo de Ghibli", "películas de Pixar")',
+  '  genero   — se pide un tema o género ("animes de deportes", "cine de terror")',
+  '  titulo   — se nombra una obra concreta ("Breaking Bad")',
+  'busqueda: el nombre limpio a buscar, sin "todas las de" ni "películas de".',
+  'rol: "director" o "actor" solo cuando intencion es persona; si no, cadena vacía.',
+  '',
+  'Ejemplos:',
+  '  "traeme todo lo que dirigio Christopher Nolan" -> cine / persona / Christopher Nolan / director',
+  '  "la trilogia de El Padrino" -> cine / saga / El Padrino / ""',
+  '  "todo boku no hero academia" -> anime / titulo / Boku no Hero Academia / ""',
+  '  "animes de deportes" -> anime / genero / Sports / ""'
+].join('\n');
+
 function crearCliente() {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error('Falta ANTHROPIC_API_KEY en el .env de StreamFlix');
@@ -135,13 +181,13 @@ function crearCliente() {
 // Los reintentos ante una negativa se piden con una beta; si la cuenta o el
 // SDK todavía no la tienen, la API responde 400 y se repite sin ella en vez de
 // dejar el comando inservible.
-async function pedirAClaude(mensaje) {
+async function pedirAClaude(mensaje, instrucciones = INSTRUCCIONES, esquema = ESQUEMA) {
   const client = crearCliente();
   const base = {
     model: MODELO,
     max_tokens: 16000,
-    system: INSTRUCCIONES,
-    output_config: { format: { type: 'json_schema', schema: ESQUEMA } },
+    system: instrucciones,
+    output_config: { format: { type: 'json_schema', schema: esquema } },
     messages: [{ role: 'user', content: mensaje }]
   };
 
@@ -170,14 +216,14 @@ async function pedirAClaude(mensaje) {
 
 // Ollama no lleva SDK propio aquí: es una petición HTTP y así el módulo se
 // carga igual en un Node sin fetch global.
-function pedirAOllama(mensaje) {
+function pedirAOllama(mensaje, instrucciones = INSTRUCCIONES_CORTAS, esquema = ESQUEMA) {
   const cuerpo = JSON.stringify({
     model: OLLAMA_MODELO,
     stream: false,
-    format: ESQUEMA,
+    format: esquema,
     options: { temperature: 0 },
     messages: [
-      { role: 'system', content: INSTRUCCIONES_CORTAS },
+      { role: 'system', content: instrucciones },
       { role: 'user', content: mensaje }
     ]
   });
@@ -232,17 +278,57 @@ function pedirAOllama(mensaje) {
 // Sol"), y entonces el importador busca algo que no existe y el emparejador
 // difuso puede colar otra cosa en el catálogo. Usarlo es una decisión, no un
 // respaldo silencioso.
+// Por defecto interpreta el modelo local: es gratis y para esta tarea llega.
+// Claude solo entra si se pide, o como red de seguridad si Ollama no responde.
 function elegirProveedor() {
   const pedido = String(process.env.PEDIDO_PROVEEDOR || '').trim().toLowerCase();
   if (pedido === 'claude' || pedido === 'ollama') return pedido;
   if (pedido) throw new Error(`PEDIDO_PROVEEDOR solo acepta "claude" u "ollama", no "${pedido}"`);
-  if (process.env.ANTHROPIC_API_KEY) return 'claude';
+  return 'ollama';
+}
 
-  throw new Error(
-    'No hay motor configurado para /pide. Elige uno en el .env:\n' +
-      '• ANTHROPIC_API_KEY=sk-ant-…  (listas fiables, céntimos por pedido)\n' +
-      `• PEDIDO_PROVEEDOR=ollama     (gratis con ${OLLAMA_MODELO}, pero se inventa títulos)`
-  );
+async function preguntarAlModelo(mensaje, { instrucciones, instruccionesCortas, esquema }) {
+  const proveedor = elegirProveedor();
+
+  if (proveedor === 'claude') {
+    return { crudo: await pedirAClaude(mensaje, instrucciones, esquema), proveedor, modelo: MODELO };
+  }
+
+  try {
+    return { crudo: await pedirAOllama(mensaje, instruccionesCortas, esquema), proveedor: 'ollama', modelo: OLLAMA_MODELO };
+  } catch (error) {
+    if (!process.env.ANTHROPIC_API_KEY) throw error;
+    // Con clave a mano no tiene sentido dejar el comando muerto porque el
+    // servidor local esté apagado o sin memoria.
+    return { crudo: await pedirAClaude(mensaje, instrucciones, esquema), proveedor: 'claude', modelo: MODELO };
+  }
+}
+
+// Saca del pedido qué se está buscando, para poder preguntárselo a quien tiene
+// el dato. Si el modelo no da algo usable, se devuelve null y quien llama cae
+// al camino antiguo de pedirle la lista entera al modelo.
+async function interpretarPedido(texto) {
+  let respuesta;
+  try {
+    respuesta = await preguntarAlModelo(texto, {
+      instrucciones: INSTRUCCIONES_INTENCION,
+      instruccionesCortas: INSTRUCCIONES_INTENCION,
+      esquema: ESQUEMA_INTENCION
+    });
+    const datos = JSON.parse(extraerJson(respuesta.crudo));
+    const busqueda = String(datos?.busqueda || '').trim();
+    if (!busqueda) return null;
+
+    return {
+      ambito: datos.ambito === 'anime' ? 'anime' : 'cine',
+      intencion: ['persona', 'saga', 'estudio', 'genero', 'titulo'].includes(datos.intencion) ? datos.intencion : 'titulo',
+      busqueda,
+      rol: datos.rol === 'actor' ? 'actor' : 'director',
+      interprete: respuesta.modelo
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Un modelo pequeño a veces envuelve el JSON en texto pese al esquema.
@@ -276,12 +362,15 @@ function normalizar(datos) {
   return { interpretacion: String(datos?.interpretacion || '').trim(), titulos };
 }
 
-async function expandirPedido(pedido) {
-  const texto = String(pedido || '').trim();
-  if (!texto) throw new Error('El pedido está vacío');
-
-  const proveedor = elegirProveedor();
-  const crudo = proveedor === 'ollama' ? await pedirAOllama(texto) : await pedirAClaude(texto);
+// Camino antiguo: pedirle la lista entera al modelo. Solo se usa cuando
+// ninguna fuente de datos puede responder, porque es el que se deja títulos y
+// de vez en cuando se inventa alguno.
+async function listarConElModelo(texto) {
+  const { crudo, proveedor, modelo } = await preguntarAlModelo(texto, {
+    instrucciones: INSTRUCCIONES,
+    instruccionesCortas: INSTRUCCIONES_CORTAS,
+    esquema: ESQUEMA
+  });
 
   let datos;
   try {
@@ -290,14 +379,57 @@ async function expandirPedido(pedido) {
     throw new Error(`La respuesta de ${proveedor} no vino en el formato esperado`);
   }
 
-  return {
-    ...normalizar(datos),
-    proveedor,
-    modelo: proveedor === 'ollama' ? OLLAMA_MODELO : MODELO
-  };
+  return { ...normalizar(datos), fuente: modelo, exacta: false };
 }
 
-module.exports = { expandirPedido, elegirProveedor, MAX_TITULOS, TIPOS };
+async function expandirPedido(pedido) {
+  const texto = String(pedido || '').trim();
+  if (!texto) throw new Error('El pedido está vacío');
+
+  // Primero el camino bueno: el modelo solo interpreta y los títulos salen de
+  // una base de datos de cine, que ni se los inventa ni se deja la mitad.
+  const intencion = await interpretarPedido(texto);
+  if (intencion) {
+    try {
+      const encontrado = await buscarEnFuentes(intencion, MAX_TITULOS);
+      if (encontrado && encontrado.titulos.length) {
+        const { titulos } = normalizar({ titulos: encontrado.titulos });
+        if (titulos.length) {
+          return {
+            interpretacion: describirIntencion(intencion),
+            titulos,
+            fuente: encontrado.fuente,
+            exacta: true
+          };
+        }
+      }
+    } catch (error) {
+      // Una fuente caída no puede dejar el comando inservible: se avisa por
+      // registro y se sigue por el camino antiguo.
+      console.error(`fuente de datos no disponible: ${error.message}`);
+    }
+  }
+
+  const respaldo = await listarConElModelo(texto);
+  if (!respaldo.titulos.length) return respaldo;
+
+  // Cuando el ámbito era cine y no hay clave de TMDB, la lista viene del
+  // modelo: conviene decir por qué es peor de lo que podría ser.
+  if (intencion && intencion.ambito === 'cine' && !hayTmdb()) {
+    respaldo.falta = 'TMDB_API_KEY';
+  }
+  return respaldo;
+}
+
+function describirIntencion({ ambito, intencion, busqueda, rol }) {
+  if (intencion === 'persona') return `Obra de ${busqueda} como ${rol}`;
+  if (intencion === 'saga') return `Saga ${busqueda}`;
+  if (intencion === 'estudio') return `Producciones de ${busqueda}`;
+  if (intencion === 'genero') return `${ambito === 'anime' ? 'Anime' : 'Cine'} del género ${busqueda}`;
+  return busqueda;
+}
+
+module.exports = { expandirPedido, interpretarPedido, elegirProveedor, MAX_TITULOS, TIPOS };
 
 if (require.main === module) {
   const pedido = process.argv.slice(2).join(' ');

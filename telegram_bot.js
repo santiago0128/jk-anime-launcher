@@ -359,12 +359,17 @@ async function atender(mensaje) {
 
     pendiente = { pedido: argumento, titulos: propuesta.titulos, creado: Date.now() };
 
-    // Se dice qué modelo la armó porque explica la calidad de la lista: el
-    // modelo local del servidor se deja títulos fuera y se inventa los años.
-    const firma =
-      propuesta.proveedor === 'ollama'
-        ? `⚠️ <i>vía ${escaparHtml(propuesta.modelo)} (local): repasa la lista antes de /ok. Se deja títulos fuera y de vez en cuando se inventa alguno.</i>`
-        : `<i>vía ${escaparHtml(propuesta.modelo)}</i>`;
+    // De dónde salió la lista explica cuánto fiarse: una base de datos de cine
+    // da la filmografía entera, un modelo de memoria se deja títulos.
+    const firma = propuesta.exacta
+      ? `<i>datos de ${escaparHtml(propuesta.fuente)} — lista completa</i>`
+      : [
+          `⚠️ <i>lista armada por ${escaparHtml(propuesta.fuente)} de memoria: repásala antes de /ok,`,
+          'se deja títulos fuera y de vez en cuando se inventa alguno.</i>',
+          propuesta.falta === 'TMDB_API_KEY'
+            ? '\n💡 <i>Con una clave gratuita de TMDB en el .env esto saldría completo y exacto.</i>'
+            : ''
+        ].join(' ');
 
     return responder(chatId, [
       `<b>${propuesta.titulos.length} títulos</b> para «${escaparHtml(argumento)}»`,
