@@ -16,6 +16,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { enviarMensaje } = require('./telegram_notify.js');
+const { expandirPedido } = require('./expandir_pedido.js');
 
 const raizStreamflix = process.env.STREAMFLIX_ROOT;
 if (raizStreamflix && fs.existsSync(path.join(raizStreamflix, '.env'))) {
@@ -38,10 +39,16 @@ if (!AUTORIZADOS.length) {
 }
 
 const AYUDA = [
-  '<b>Importar</b>',
+  '<b>Importar un título</b>',
   '/serie Breaking Bad',
   '/pelicula Interestelar',
   '/anime Dragon Ball Z',
+  '',
+  '<b>Importar por lotes</b>',
+  '/pide — le pides a Claude en tus palabras y él arma la lista',
+  '   ejemplo: <code>/pide la trilogía de El Padrino</code>',
+  '   te enseño la lista y la confirmas con /ok (o /no)',
+  '/cancelar — corta el lote en curso',
   '',
   '<b>Consultar</b>',
   '/estado — cómo va la importación en curso',
@@ -50,9 +57,25 @@ const AYUDA = [
   '/ayuda'
 ].join('\n');
 
+const URL_CATALOGO = process.env.STREAMFLIX_URL || 'http://170.187.142.36';
+
+// Telegram interpreta el mensaje como HTML, así que un título con & o < lo
+// rompe entero. Los nombres vienen de sitios ajenos y de Claude: no son de fiar.
+const escaparHtml = (texto) =>
+  String(texto == null ? '' : texto).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 // Una importación a la vez: son decenas de descargas y lanzar varias en
 // paralelo solo consigue que el sitio de origen empiece a rechazar.
 let ocupado = null;
+
+// Lista que Claude propuso y todavía no se ha confirmado. Un lote puede ser
+// media noche de descargas, así que se enseña antes de lanzarlo.
+let pendiente = null;
+const CADUCIDAD_PENDIENTE = 15 * 60 * 1000;
+
+// Lote en curso: los títulos van de uno en uno, igual que una importación
+// suelta, y esto solo lleva la cuenta de por dónde va.
+let lote = null;
 
 // El importador deja aquí por dónde va, venga de donde venga: del bot, del
 // cron o de un script suelto. Por eso /estado puede informar de una carga que
@@ -83,7 +106,7 @@ function describirProgreso(p) {
   const transcurrido = inicio ? (Date.now() - inicio) / 1000 : null;
 
   if (p.estado === 'importando') {
-    const lineas = [`⏳ <b>${p.titulo}</b> (${p.tipo})`];
+    const lineas = [`⏳ <b>${escaparHtml(p.titulo)}</b> (${escaparHtml(p.tipo)})`];
 
     if (p.total) {
       const pct = Math.round((p.hechos / p.total) * 100);
@@ -107,7 +130,7 @@ function describirProgreso(p) {
   }
 
   if (p.estado === 'terminado') {
-    const partes = [`✅ <b>${p.titulo}</b> (${p.tipo})`, `${p.hechos} capítulos importados`];
+    const partes = [`✅ <b>${escaparHtml(p.titulo)}</b> (${escaparHtml(p.tipo)})`, `${p.hechos} capítulos importados`];
     if (p.saltados) partes.push(`${p.saltados} sin video disponible`);
     if (p.fallidos) partes.push(`${p.fallidos} fallidos`);
     if (transcurrido) partes.push(`Tardó ${formatearDuracion(transcurrido)}`);
@@ -115,7 +138,7 @@ function describirProgreso(p) {
     return partes.join('\n');
   }
 
-  return `❌ <b>${p.titulo || 'importación'}</b>\n${p.motivo || 'terminó con error'}`;
+  return `❌ <b>${escaparHtml(p.titulo || 'importación')}</b>\n${escaparHtml(p.motivo || 'terminó con error')}`;
 }
 
 // Vigila el archivo de progreso para avisar cuando una carga termina, aunque
@@ -165,7 +188,7 @@ const responder = (chatId, texto) => enviarMensaje(texto, { chatId }).catch((e) 
 
 // Lanza el importador como proceso aparte: si un título revienta, se lleva por
 // delante su propio proceso y no el bot.
-function importar(tipo, nombre, chatId) {
+function importar(tipo, nombre) {
   return new Promise((resolve) => {
     const args =
       tipo === 'anime'
@@ -183,16 +206,82 @@ function importar(tipo, nombre, chatId) {
       const saltados = (salida.match(/"skippedCount":\s*(\d+)/) || [])[1];
 
       if (n && Number(n) > 0) {
-        const extra = saltados && Number(saltados) > 0 ? `\n${saltados} capítulo(s) sin video disponible` : '';
-        resolve(`✅ <b>${titulo || nombre}</b>\n${n} capítulo(s) importados${extra}\n\nhttp://170.187.142.36`);
+        resolve({
+          ok: true,
+          titulo: titulo || nombre,
+          capitulos: Number(n),
+          saltados: Number(saltados) || 0
+        });
         return;
       }
 
       const motivo = (salida.match(/No encontré[^\n]*/) || salida.match(/No encontre[^\n]*/) ||
         salida.match(/Ningun[^\n]*/) || salida.match(/[^\n]*rror[^\n]*/) || ['no se pudo importar'])[0];
-      resolve(`❌ <b>${nombre}</b>\n${motivo.slice(0, 300)}`);
+      resolve({ ok: false, titulo: nombre, motivo: motivo.slice(0, 300) });
     });
   });
+}
+
+function describirImportacion(resultado) {
+  if (!resultado.ok) {
+    return `❌ <b>${escaparHtml(resultado.titulo)}</b>\n${escaparHtml(resultado.motivo)}`;
+  }
+  const extra = resultado.saltados ? `\n${resultado.saltados} capítulo(s) sin video disponible` : '';
+  return `✅ <b>${escaparHtml(resultado.titulo)}</b>\n${resultado.capitulos} capítulo(s) importados${extra}\n\n${URL_CATALOGO}`;
+}
+
+const ICONO = { anime: '🌸', serie: '📺', pelicula: '🎬' };
+
+function describirLista(propuesta) {
+  const lineas = propuesta.titulos.map((t, i) => {
+    const anio = t.anio ? ` <i>(${t.anio})</i>` : '';
+    return `${String(i + 1).padStart(2)}. ${ICONO[t.tipo] || ''} ${escaparHtml(t.titulo)}${anio}`;
+  });
+  return lineas.join('\n');
+}
+
+// El lote va de uno en uno por la misma razón que no se permiten dos
+// importaciones a la vez: en paralelo el sitio de origen empieza a rechazar.
+async function correrLote(chatId) {
+  const total = lote.titulos.length;
+
+  for (const item of lote.titulos) {
+    if (lote.cancelado) break;
+
+    lote.indice += 1;
+    lote.actual = item.titulo;
+    const marca = `[${lote.indice}/${total}]`;
+
+    const resultado = await importar(item.tipo, item.titulo);
+    lote.resultados.push(resultado);
+
+    await responder(
+      chatId,
+      resultado.ok
+        ? `${marca} ✅ <b>${escaparHtml(resultado.titulo)}</b> — ${resultado.capitulos} cap`
+        : `${marca} ❌ <b>${escaparHtml(item.titulo)}</b> — ${escaparHtml(resultado.motivo)}`
+    );
+  }
+
+  const buenos = lote.resultados.filter((r) => r.ok);
+  const capitulos = buenos.reduce((suma, r) => suma + r.capitulos, 0);
+  const fallidos = lote.resultados.filter((r) => !r.ok);
+  const transcurrido = (Date.now() - lote.iniciado) / 1000;
+
+  const resumen = [
+    lote.cancelado ? '🛑 <b>Lote cancelado</b>' : '🎉 <b>Lote terminado</b>',
+    `${buenos.length} de ${total} títulos, ${capitulos} capítulos en total`,
+    `Tardó ${formatearDuracion(transcurrido)}`
+  ];
+
+  if (fallidos.length) {
+    resumen.push('', `<b>No entraron (${fallidos.length}):</b>`);
+    for (const r of fallidos.slice(0, 15)) resumen.push(`• ${escaparHtml(r.titulo)}`);
+  }
+  resumen.push('', URL_CATALOGO);
+
+  lote = null;
+  return responder(chatId, resumen.join('\n'));
 }
 
 function ejecutarScript(script, args, chatId) {
@@ -224,7 +313,95 @@ async function atender(mensaje) {
   }
 
   if (comando === '/estado') {
-    return responder(chatId, describirProgreso(leerProgreso()));
+    const detalle = describirProgreso(leerProgreso());
+    if (!lote) return responder(chatId, detalle);
+
+    // Dentro de un lote el archivo de progreso solo cuenta el título que está
+    // descargando ahora mismo; el avance del lote lo lleva el bot.
+    const cabecera = [
+      `📦 <b>Lote:</b> ${lote.indice} de ${lote.titulos.length} títulos`,
+      `<i>${escaparHtml(lote.pedido)}</i>`,
+      ''
+    ].join('\n');
+    return responder(chatId, cabecera + detalle);
+  }
+
+  if (comando === '/cancelar') {
+    if (!lote) return responder(chatId, 'No hay ningún lote en curso.');
+    lote.cancelado = true;
+    return responder(chatId, '🛑 Vale. Corto en cuanto termine el título que está bajando ahora.');
+  }
+
+  if (['/pide', '/pedido', '/claude'].includes(comando)) {
+    if (!argumento) {
+      return responder(chatId, ['Dime qué quieres traer, en tus palabras.', '', 'Ejemplos:',
+        '<code>/pide la trilogía de El Padrino</code>',
+        '<code>/pide los animes clásicos de los 90</code>',
+        '<code>/pide lo que dirigió Tarantino</code>'].join('\n'));
+    }
+    if (ocupado) return responder(chatId, `⏳ Ya hay algo en curso: ${escaparHtml(ocupado)}. Espera a que termine.`);
+
+    await responder(chatId, '🤔 Le pregunto a Claude qué títulos son…');
+
+    let propuesta;
+    ocupado = 'consultando a Claude';
+    try {
+      propuesta = await expandirPedido(argumento);
+    } catch (error) {
+      return responder(chatId, `❌ ${escaparHtml(error.message || String(error))}`);
+    } finally {
+      ocupado = null;
+    }
+
+    if (!propuesta.titulos.length) {
+      return responder(chatId, `🤷 No saqué títulos de ahí.\n\n${escaparHtml(propuesta.interpretacion || 'Prueba a ser más concreto.')}`);
+    }
+
+    pendiente = { pedido: argumento, titulos: propuesta.titulos, creado: Date.now() };
+
+    return responder(chatId, [
+      `<b>${propuesta.titulos.length} títulos</b> para «${escaparHtml(argumento)}»`,
+      propuesta.interpretacion ? `<i>${escaparHtml(propuesta.interpretacion)}</i>` : '',
+      '',
+      describirLista(propuesta),
+      '',
+      '/ok para importarlos todos · /no para descartar'
+    ].filter(Boolean).join('\n'));
+  }
+
+  if (['/ok', '/si', '/sí', '/dale'].includes(comando)) {
+    if (!pendiente) return responder(chatId, 'No hay ninguna lista esperando. Empieza con /pide.');
+    if (Date.now() - pendiente.creado > CADUCIDAD_PENDIENTE) {
+      pendiente = null;
+      return responder(chatId, 'Esa lista ya caducó. Pídela otra vez con /pide.');
+    }
+    if (ocupado) return responder(chatId, `⏳ Ya hay algo en curso: ${escaparHtml(ocupado)}. Espera a que termine.`);
+
+    lote = { pedido: pendiente.pedido, titulos: pendiente.titulos, indice: 0, actual: null, resultados: [], cancelado: false, iniciado: Date.now() };
+    pendiente = null;
+    ocupado = `lote de ${lote.titulos.length} títulos`;
+
+    await responder(chatId, [
+      `🚀 Empiezo con ${lote.titulos.length} títulos.`,
+      'Te aviso por cada uno y con un resumen al final.',
+      'Esto va para largo: /estado para ver cómo va, /cancelar para cortar.'
+    ].join('\n'));
+
+    try {
+      await correrLote(chatId);
+    } catch (error) {
+      lote = null;
+      await responder(chatId, `❌ El lote se cortó: ${escaparHtml(error.message || String(error))}`);
+    } finally {
+      ocupado = null;
+    }
+    return;
+  }
+
+  if (['/no', '/descartar'].includes(comando)) {
+    if (!pendiente) return responder(chatId, 'No hay ninguna lista esperando.');
+    pendiente = null;
+    return responder(chatId, 'Descartada. Pide otra cosa cuando quieras.');
   }
 
   if (comando === '/catalogo') {
@@ -248,11 +425,11 @@ async function atender(mensaje) {
 
     const tipo = comando.slice(1);
     ocupado = `${tipo} "${argumento}"`;
-    await responder(chatId, `⏳ Importando <b>${argumento}</b>…\nUna serie completa puede tardar varios minutos.`);
+    await responder(chatId, `⏳ Importando <b>${escaparHtml(argumento)}</b>…\nUna serie completa puede tardar varios minutos.`);
 
-    const resultado = await importar(tipo, argumento, chatId);
+    const resultado = await importar(tipo, argumento);
     ocupado = null;
-    return responder(chatId, resultado);
+    return responder(chatId, describirImportacion(resultado));
   }
 
   return responder(chatId, `No conozco <code>${comando}</code>.\n\n${AYUDA}`);
@@ -269,7 +446,13 @@ async function escuchar() {
       const respuesta = await pedirTelegram('getUpdates', { offset: desde, timeout: 30 });
       for (const actualizacion of respuesta.result || []) {
         desde = actualizacion.update_id + 1;
-        if (actualizacion.message) await atender(actualizacion.message);
+        // Sin await: una importación tarda minutos y un lote puede tardar
+        // horas. Si el bucle esperase a que terminen, el bot quedaría sordo
+        // justo a /estado y /cancelar, que es cuando más falta hacen. Lo que
+        // no puede solaparse ya lo frena la bandera "ocupado".
+        if (actualizacion.message) {
+          atender(actualizacion.message).catch((e) => console.error('fallo atendiendo:', e.message));
+        }
       }
     } catch (error) {
       console.error('fallo consultando Telegram:', error.message);
@@ -278,5 +461,11 @@ async function escuchar() {
   }
 }
 
-vigilarProgreso();
-escuchar();
+// Solo arranca si lo ejecutan; requerirlo desde otro script (una prueba) no
+// debe abrir el polling ni dejar temporizadores sueltos.
+if (require.main === module) {
+  vigilarProgreso();
+  escuchar();
+}
+
+module.exports = { atender };

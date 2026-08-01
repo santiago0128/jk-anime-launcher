@@ -10,6 +10,7 @@
     "build:mac:x64": "pkg . --public --public-packages '*' --targets node16-macos-x64 --output jk-anime-streamflix-bot-macos-x64"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "dotenv": "^16.4.5",
     "mssql": "^9.1.1"
   },
