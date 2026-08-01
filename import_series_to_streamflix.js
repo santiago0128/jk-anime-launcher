@@ -262,6 +262,122 @@ async function findSeriesOnJkAnime(seriesName) {
   throw new Error(`No encontre una serie para "${seriesName}" en JK Anime.`);
 }
 
+// jkanime publica cada temporada como una ficha aparte y con nombres que no
+// siguen un único patrón: "2nd Season", "Final Season"… Además mezcla en la
+// misma búsqueda películas, OVAs, recopilatorios y spin-offs, que no son
+// temporadas aunque lleven el mismo nombre delante.
+const PATRONES_TEMPORADA = [
+  /^\d+(?:st|nd|rd|th)?\s*(?:season|temporada)?$/i,
+  /^(?:season|temporada)\s*\d+$/i,
+  /^final\s*(?:season|temporada)$/i,
+  /^(?:part|parte)\s*\d+$/i,
+  /^(?:ii|iii|iv|v|vi|vii|viii|ix|x)$/i
+];
+
+function normalizarTitulo(valor) {
+  return cleanText(valor)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+// Devuelve el número de orden de una temporada, o null si el resto del título
+// no es un marcador de temporada (ej. ": Memories", que es un recopilatorio).
+function ordenDeTemporada(sufijo) {
+  const resto = cleanText(sufijo).replace(/^[:\-–—\s]+/, '').trim();
+  if (!resto) return 1;
+
+  if (!PATRONES_TEMPORADA.some((patron) => patron.test(resto))) return null;
+  if (/^final/i.test(resto)) return 999;
+
+  const numero = (resto.match(/\d+/) || [])[0];
+  if (numero) return Number(numero);
+
+  const romanos = { ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+  return romanos[resto.toLowerCase()] || null;
+}
+
+// Las OVAs, especiales y películas van al final, con números altos, para que la
+// lista de temporadas de la ficha quede en orden natural.
+const ORDEN_EXTRAS = { ova: 900, ona: 901, especial: 902, pelicula: 903 };
+
+// Un sufijo que empieza por separador o por "the Movie"/"OVA" es material de la
+// MISMA serie ("Boku no Hero Academia: Memories"). Uno que añade una palabra
+// nueva antes es OTRA serie de la franquicia ("Dragon Ball Z", "Dragon Ball
+// Super: Broly"), y meterla dentro sería mezclar series distintas.
+function esMaterialDeLaMisma(sufijo) {
+  const resto = cleanText(sufijo);
+  if (!resto) return true;
+  return /^[:\-–—(]/.test(resto) || /^\s*(?:the\s+)?(?:movie|film|ova|ona|special|especial)/i.test(resto);
+}
+
+function clasificarFicha(tipo, sufijo) {
+  const clase = normalizarTitulo(tipo);
+
+  if (clase.startsWith('serie')) {
+    const orden = ordenDeTemporada(sufijo);
+    if (orden === 999) return { orden: 899, etiqueta: 'Temporada final' };
+    if (orden != null) return { orden, etiqueta: `Temporada ${orden}` };
+    // No es temporada: solo cuenta si es material de esta misma serie.
+    return esMaterialDeLaMisma(sufijo) ? { orden: ORDEN_EXTRAS.especial, etiqueta: 'Especiales' } : null;
+  }
+
+  if (!esMaterialDeLaMisma(sufijo)) return null;
+
+  if (clase.startsWith('ova')) return { orden: ORDEN_EXTRAS.ova, etiqueta: 'OVAs' };
+  if (clase.startsWith('ona')) return { orden: ORDEN_EXTRAS.ona, etiqueta: 'ONAs' };
+  if (clase.startsWith('pelicula') || clase.startsWith('movie')) {
+    return { orden: ORDEN_EXTRAS.pelicula, etiqueta: 'Películas' };
+  }
+
+  return { orden: ORDEN_EXTRAS.especial, etiqueta: 'Especiales' };
+}
+
+async function findAnimeSeasons(seriesName) {
+  const searchUrl = `https://jkanime.net/buscar?q=${encodeURIComponent(seriesName)}`;
+  const html = await fetchText(searchUrl);
+  const candidatos = [...html.matchAll(/<div class="anime__item__text">[\s\S]*?<li class="anime">([\s\S]*?)<\/li>[\s\S]*?<h5><a[^>]*href="([^"]+)">([\s\S]*?)<\/a><\/h5>/g)].map(
+    (match) => ({ tipo: cleanText(match[1]), url: match[2], title: cleanText(match[3]) })
+  );
+
+  // La base es la ficha de tipo serie más corta que coincide con lo buscado; el
+  // resto del material de la franquicia empieza por ese nombre.
+  const objetivo = normalizarTitulo(seriesName);
+  const series = candidatos.filter((item) => normalizarTitulo(item.tipo).startsWith('serie'));
+  const base =
+    series.find((item) => normalizarTitulo(item.title) === objetivo) ||
+    series
+      .filter((item) => normalizarTitulo(item.title).startsWith(objetivo))
+      .sort((a, b) => a.title.length - b.title.length)[0];
+
+  if (!base) return [];
+
+  const prefijo = normalizarTitulo(base.title);
+  const fichas = [];
+
+  for (const item of candidatos) {
+    // Un spin-off como "Vigilante: Boku no Hero Academia" no empieza por el
+    // nombre base, así que queda fuera: es otra serie, no material de esta.
+    if (!normalizarTitulo(item.title).startsWith(prefijo)) continue;
+
+    const clasificacion = clasificarFicha(item.tipo, item.title.slice(base.title.length));
+    if (!clasificacion) continue;
+    fichas.push({ ...item, ...clasificacion });
+  }
+
+  // Varias fichas pueden caer en la misma categoría (dos OVAs, cuatro
+  // películas); se numeran hacia arriba para no pisarse la temporada.
+  const usados = new Set();
+  for (const ficha of fichas.sort((a, b) => a.orden - b.orden || a.title.localeCompare(b.title))) {
+    while (usados.has(ficha.orden)) ficha.orden += 1;
+    usados.add(ficha.orden);
+  }
+
+  return fichas;
+}
+
 async function getSeriesMetadataFromUrl(seriesUrl) {
   const normalizedUrl = seriesUrl.endsWith('/') ? seriesUrl : `${seriesUrl}/`;
   const html = await fetchText(normalizedUrl);
@@ -376,6 +492,12 @@ function importEpisode(config, episodeNumber) {
     aniskipAnimeId: config.aniskipId,
     releaseYear: config.releaseYear,
     rating: config.rating,
+    // Todas las fichas de la franquicia van a la misma serie del catálogo, cada
+    // una como su propia temporada.
+    seriesTitle: config.franquicia,
+    seriesSourceRef: config.referencia,
+    seasonNumber: config.seasonNumber,
+    seasonTitle: config.seasonTitle,
     emitJson: false
   }).catch((error) => {
     throw new Error(`Fallo el episodio ${episodeNumber}: ${error.message || String(error)}`);
@@ -608,17 +730,92 @@ async function main() {
     throw new Error('Los parametros --start y --end deben ser enteros validos.');
   }
 
-  let jkSeries;
+  // Una franquicia está repartida en varias fichas del sitio (temporadas, OVAs,
+  // especiales, películas). Buscando por nombre se traen todas y se guardan
+  // como UNA serie con varias temporadas; con --series-url se importa solo esa.
+  let fichas;
   if (seriesUrlArg) {
-    jkSeries = await getSeriesMetadataFromUrl(seriesUrlArg);
+    const unica = await getSeriesMetadataFromUrl(seriesUrlArg);
+    fichas = [{ title: unica.title, url: unica.url, orden: 1, etiqueta: 'Temporada 1', metadatos: unica }];
   } else if (seriesName) {
-    // Buscar por nombre solo devuelve la ficha; hay que abrirla para saber
-    // cuantos capitulos tiene, si no se importaba siempre uno solo.
-    const found = await findSeriesOnJkAnime(seriesName);
-    jkSeries = await getSeriesMetadataFromUrl(found.url);
+    const encontradas = await findAnimeSeasons(seriesName);
+    if (!encontradas.length) {
+      // Sin coincidencias por franquicia se cae a la búsqueda de una sola ficha.
+      const found = await findSeriesOnJkAnime(seriesName);
+      fichas = [{ title: found.title, url: found.url, orden: 1, etiqueta: 'Temporada 1' }];
+    } else {
+      fichas = args['solo-esta'] === 'true' ? [encontradas[0]] : encontradas;
+    }
   } else {
     throw new Error('Debes enviar --series-name "Nombre de la serie" o --series-url "https://jkanime.net/serie/".');
   }
+
+  const nombreFranquicia = fichas[0].title;
+  const refFranquicia = `jkanime:${slugFromUrl(fichas[0].url)}`;
+
+  if (fichas.length > 1) {
+    process.stderr.write(`Encontré ${fichas.length} fichas de "${nombreFranquicia}":\n`);
+    fichas.forEach((f) => process.stderr.write(`   ${String(f.orden).padStart(3)}  ${f.etiqueta.padEnd(16)} ${f.title}\n`));
+  }
+
+  const resumenFichas = [];
+  let totalImportados = 0;
+  let totalFallidos = 0;
+  const iniciadoTodo = new Date().toISOString();
+
+  for (const [indice, ficha] of fichas.entries()) {
+    const jkSeries = ficha.metadatos || (await getSeriesMetadataFromUrl(ficha.url));
+    const resultado = await importarFicha({
+      jkSeries,
+      ficha,
+      args,
+      seriesName,
+      contentType,
+      franquicia: { nombre: nombreFranquicia, referencia: refFranquicia },
+      posicion: { indice: indice + 1, total: fichas.length },
+      iniciadoTodo
+    });
+
+    resumenFichas.push(resultado);
+    totalImportados += resultado.importedCount;
+    totalFallidos += resultado.failedCount;
+  }
+
+  escribirProgreso({
+    estado: totalImportados ? 'terminado' : 'error',
+    tipo: 'anime',
+    titulo: nombreFranquicia,
+    hechos: totalImportados,
+    total: totalImportados,
+    fallidos: totalFallidos,
+    iniciado: iniciadoTodo
+  });
+
+  if (!totalImportados) {
+    throw new Error(`No pude importar ningún capítulo de "${nombreFranquicia}".`);
+  }
+
+  console.log(
+    JSON.stringify(
+      {
+        seriesName: nombreFranquicia,
+        sourceRef: refFranquicia,
+        temporadas: resumenFichas.length,
+        importedCount: totalImportados,
+        failedCount: totalFallidos,
+        detalle: resumenFichas
+      },
+      null,
+      2
+    )
+  );
+  return;
+}
+
+// Importa una ficha del sitio como una temporada de la franquicia.
+async function importarFicha({ jkSeries, ficha, args, seriesName, contentType, franquicia, posicion, iniciadoTodo }) {
+  let start = Number(args.start || 1);
+  let end = Number(args.end || start);
 
   if (!args.end && jkSeries.totalEpisodes) {
     end = jkSeries.totalEpisodes;
@@ -651,7 +848,12 @@ async function main() {
     seriesSlug: slugFromUrl(jkSeries.url),
     aniskipId: aniList?.id || null,
     releaseYear: aniList?.releaseYear || null,
-    rating: aniList?.rating || null
+    rating: aniList?.rating || null,
+    // Todo va bajo la misma ficha de catálogo; esta entra como una temporada.
+    franquicia: franquicia.nombre,
+    referencia: franquicia.referencia,
+    seasonNumber: ficha.orden,
+    seasonTitle: ficha.etiqueta
   };
 
   if (shouldOpenBrowser(args)) openUrlInBrowser(getBrowserTargetUrl(contentType, config.seriesUrl));
@@ -659,12 +861,13 @@ async function main() {
   const imported = [];
   const failed = [];
   const total = end - start + 1;
-  const iniciado = new Date().toISOString();
+  const iniciado = iniciadoTodo || new Date().toISOString();
+  const sufijoParte = posicion.total > 1 ? ` (${posicion.indice}/${posicion.total}: ${ficha.etiqueta})` : '';
 
   escribirProgreso({
     estado: 'importando',
     tipo: 'anime',
-    titulo: config.seriesName,
+    titulo: `${franquicia.nombre}${sufijoParte}`,
     hechos: 0,
     total,
     iniciado
@@ -693,7 +896,7 @@ async function main() {
     escribirProgreso({
       estado: 'importando',
       tipo: 'anime',
-      titulo: config.seriesName,
+      titulo: `${franquicia.nombre}${sufijoParte}`,
       hechos: imported.length + failed.length,
       total,
       fallidos: failed.length,
@@ -702,47 +905,31 @@ async function main() {
     });
   }
 
-  escribirProgreso({
-    estado: imported.length ? 'terminado' : 'error',
-    tipo: 'anime',
-    titulo: config.seriesName,
-    hechos: imported.length,
-    total,
-    fallidos: failed.length,
-    iniciado
-  });
 
-  if (!imported.length) {
-    throw new Error(
-      `No pude importar ningún capítulo de "${config.seriesName}".${
-        failed[0] ? ` Motivo del primero: ${failed[0].reason}` : ''
-      }`
-    );
-  }
 
-  console.log(
-    JSON.stringify(
-      {
-        seriesName: config.seriesName,
-        seriesSlug: config.seriesSlug,
-        seriesUrl: config.seriesUrl,
-        totalEpisodesDetected: jkSeries.totalEpisodes || null,
-        aniskipId: config.aniskipId,
-        releaseYear: config.releaseYear,
-        rating: config.rating,
-        importedRange: { start, end },
-        importedCount: imported.length,
-        failedCount: failed.length,
-        imported,
-        failed
-      },
-      null,
-      2
-    )
-  );
+  // El resumen lo imprime main() con el total de la franquicia; aquí solo se
+  // devuelve lo de esta temporada.
+  return {
+    temporada: ficha.orden,
+    etiqueta: ficha.etiqueta,
+    fichaTitulo: config.seriesName,
+    fichaUrl: config.seriesUrl,
+    totalEpisodesDetected: jkSeries.totalEpisodes || null,
+    aniskipId: config.aniskipId,
+    releaseYear: config.releaseYear,
+    rating: config.rating,
+    importedRange: { start, end },
+    importedCount: imported.length,
+    failedCount: failed.length,
+    failed
+  };
 }
 
-main().catch((error) => {
-  console.error(error.message || String(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.message || String(error));
+    process.exit(1);
+  });
+}
+
+module.exports = { findAnimeSeasons, clasificarFicha, ordenDeTemporada };

@@ -72,7 +72,14 @@ function buildRuntimeConfig(overrides = {}) {
     episodeUrl,
     aniskipAnimeId: aniskipAnimeIdRaw != null && aniskipAnimeIdRaw !== '' ? Number(aniskipAnimeIdRaw) : null,
     releaseYear: releaseYearRaw != null && releaseYearRaw !== '' ? Number(releaseYearRaw) : null,
-    rating: ratingRaw != null && ratingRaw !== '' ? Number(ratingRaw) : null
+    rating: ratingRaw != null && ratingRaw !== '' ? Number(ratingRaw) : null,
+    // Una franquicia con varias fichas en el sitio de origen (temporadas, OVAs,
+    // especiales) se guarda como UNA serie con varias temporadas dentro, en vez
+    // de como varias series sueltas con el mismo nombre.
+    seriesTitle: overrides.seriesTitle || null,
+    seriesSourceRef: overrides.seriesSourceRef || null,
+    seasonNumber: overrides.seasonNumber != null ? Number(overrides.seasonNumber) : null,
+    seasonTitle: overrides.seasonTitle || null
   };
 }
 
@@ -728,11 +735,16 @@ async function ensureSnapshotTable(pool) {
 }
 
 async function ensureSeries(pool, episodeData) {
-  const { releaseYear, rating } = getRuntimeConfig();
+  const { releaseYear, rating, seriesTitle, seriesSourceRef } = getRuntimeConfig();
+  // Cuando la ficha es una temporada de una franquicia, la fila de Series es la
+  // de la franquicia entera, no la de esta ficha suelta.
+  const tituloSerie = seriesTitle || episodeData.seriesTitle;
+  const referencia = seriesSourceRef || `jkanime:${episodeData.seriesSlug}`;
+
   const existing = await pool
     .request()
-    .input('sourceRef', `jkanime:${episodeData.seriesSlug}`)
-    .input('title', episodeData.seriesTitle)
+    .input('sourceRef', referencia)
+    .input('title', tituloSerie)
     .query(`
       SELECT TOP 1 Id
       FROM dbo.Series
@@ -746,14 +758,14 @@ async function ensureSeries(pool, episodeData) {
     await pool
       .request()
       .input('id', seriesId)
-      .input('title', episodeData.seriesTitle)
+      .input('title', tituloSerie)
       .input('description', episodeData.seriesSynopsis)
       .input('posterUrl', episodeData.posterUrl)
       .input('backdropUrl', episodeData.ogImageUrl)
       .input('releaseYear', releaseYear)
       .input('rating', rating)
       .input('contentType', 'anime')
-      .input('sourceRef', `jkanime:${episodeData.seriesSlug}`)
+      .input('sourceRef', referencia)
       .query(`
         UPDATE dbo.Series
         SET
@@ -773,14 +785,14 @@ async function ensureSeries(pool, episodeData) {
 
   const inserted = await pool
     .request()
-    .input('title', episodeData.seriesTitle)
+    .input('title', tituloSerie)
     .input('description', episodeData.seriesSynopsis)
     .input('posterUrl', episodeData.posterUrl)
     .input('backdropUrl', episodeData.ogImageUrl)
     .input('releaseYear', releaseYear)
     .input('rating', rating)
     .input('contentType', 'anime')
-    .input('sourceRef', `jkanime:${episodeData.seriesSlug}`)
+    .input('sourceRef', referencia)
     .query(`
       INSERT INTO dbo.Series (
         Title,
@@ -809,8 +821,12 @@ async function ensureSeries(pool, episodeData) {
 }
 
 async function ensureSeason(pool, seriesId) {
-  const seasonNumber = 1;
-  const seasonTitle = 'Temporada 1';
+  const config = getRuntimeConfig();
+  // Cada ficha del sitio de origen entra como una temporada de la franquicia:
+  // las numeradas van 1, 2, 3…, y las OVAs, especiales y películas ocupan
+  // números altos para quedar al final de la lista.
+  const seasonNumber = config.seasonNumber != null ? config.seasonNumber : 1;
+  const seasonTitle = config.seasonTitle || `Temporada ${seasonNumber}`;
   const existing = await pool
     .request()
     .input('seriesId', seriesId)
