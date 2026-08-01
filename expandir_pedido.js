@@ -8,15 +8,16 @@
 //
 // Sirven dos motores y la diferencia se nota:
 //   claude  la API de Anthropic. Listas completas; cuesta céntimos por pedido.
-//   ollama  el que ya corre en el servidor. Gratis, pero un modelo pequeño se
-//           deja títulos fuera y se inventa los años.
+//   ollama  el que ya corre en el servidor. Gratis, pero con un modelo pequeño
+//           se inventa títulos que no existen y confunde series con películas,
+//           así que hay que repasar la lista antes de importarla.
 //
 // Uso desde consola (imprime JSON):
 //   node expandir_pedido.js "la trilogia original de star wars"
 //
 // Variables:
 //   PEDIDO_PROVEEDOR    claude | ollama. Si no se pone, usa claude cuando hay
-//                       clave y ollama en caso contrario.
+//                       clave; ollama nunca se elige solo.
 //   ANTHROPIC_API_KEY   necesaria para el motor claude
 //   OLLAMA_URL          por defecto http://host.docker.internal:11434
 //   OLLAMA_MODELO       por defecto qwen2.5:1.5b
@@ -99,6 +100,27 @@ const INSTRUCCIONES = [
 
 // El SDK se carga aquí y no arriba para que el bot arranque igual aunque esta
 // dependencia falte: el resto de comandos no la necesitan.
+// Las instrucciones de arriba están escritas para un modelo grande y a uno
+// pequeño lo ahogan: con ellas, qwen2.5:1.5b se agarraba a la regla del pedido
+// ambiguo y devolvía la lista vacía hasta para "la trilogía de El Padrino".
+// Estas son las mismas ideas en la mitad de líneas y sin matices.
+const INSTRUCCIONES_CORTAS = [
+  'Recibes un pedido y devuelves los títulos concretos de cine, TV o anime que lo componen.',
+  '',
+  'Reglas:',
+  '- Devuelve siempre todos los títulos que conozcas. Nunca pidas aclaraciones ni',
+  '  devuelvas la lista vacía si el pedido nombra algo que se pueda ver.',
+  '- Usa el título exacto y real. Si no recuerdas cómo se llama de verdad, no lo incluyas:',
+  '  un título inventado hace que el importador busque algo que no existe.',
+  '- tipo: "anime" si es animación japonesa, "serie" si es de imagen real por temporadas,',
+  '  "pelicula" si es un largometraje.',
+  '- Una serie es UN solo título: no enumeres temporadas ni capítulos.',
+  '- anio es el año de estreno; si no estás seguro pon 0.',
+  '- Ordena del más antiguo al más nuevo.',
+  `- Como mucho ${MAX_TITULOS} títulos.`,
+  '- En interpretacion, una frase corta con lo que entendiste.'
+].join('\n');
+
 function crearCliente() {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error('Falta ANTHROPIC_API_KEY en el .env de StreamFlix');
@@ -155,7 +177,7 @@ function pedirAOllama(mensaje) {
     format: ESQUEMA,
     options: { temperature: 0 },
     messages: [
-      { role: 'system', content: INSTRUCCIONES },
+      { role: 'system', content: INSTRUCCIONES_CORTAS },
       { role: 'user', content: mensaje }
     ]
   });
@@ -205,13 +227,22 @@ function pedirAOllama(mensaje) {
   });
 }
 
-// Sin configurar nada se usa lo que haya: la clave si está, y si no el Ollama
-// del servidor. Así el comando funciona desde el primer momento.
+// Ollama no se elige solo aunque esté ahí, y esto es a propósito: un modelo
+// pequeño no solo se deja títulos, se los inventa ("El Padrino: El Segundo
+// Sol"), y entonces el importador busca algo que no existe y el emparejador
+// difuso puede colar otra cosa en el catálogo. Usarlo es una decisión, no un
+// respaldo silencioso.
 function elegirProveedor() {
   const pedido = String(process.env.PEDIDO_PROVEEDOR || '').trim().toLowerCase();
   if (pedido === 'claude' || pedido === 'ollama') return pedido;
   if (pedido) throw new Error(`PEDIDO_PROVEEDOR solo acepta "claude" u "ollama", no "${pedido}"`);
-  return process.env.ANTHROPIC_API_KEY ? 'claude' : 'ollama';
+  if (process.env.ANTHROPIC_API_KEY) return 'claude';
+
+  throw new Error(
+    'No hay motor configurado para /pide. Elige uno en el .env:\n' +
+      '• ANTHROPIC_API_KEY=sk-ant-…  (listas fiables, céntimos por pedido)\n' +
+      `• PEDIDO_PROVEEDOR=ollama     (gratis con ${OLLAMA_MODELO}, pero se inventa títulos)`
+  );
 }
 
 // Un modelo pequeño a veces envuelve el JSON en texto pese al esquema.

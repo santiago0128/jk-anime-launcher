@@ -363,7 +363,7 @@ async function atender(mensaje) {
     // modelo local del servidor se deja títulos fuera y se inventa los años.
     const firma =
       propuesta.proveedor === 'ollama'
-        ? `<i>vía ${escaparHtml(propuesta.modelo)} (local) — puede dejarse títulos; añádelos con /serie, /pelicula o /anime</i>`
+        ? `⚠️ <i>vía ${escaparHtml(propuesta.modelo)} (local): repasa la lista antes de /ok. Este modelo se inventa títulos y confunde series con películas.</i>`
         : `<i>vía ${escaparHtml(propuesta.modelo)}</i>`;
 
     return responder(chatId, [
