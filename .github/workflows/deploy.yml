@@ -1,0 +1,42 @@
+name: Desplegar el bot en el servidor
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.claude/**'
+  workflow_dispatch:
+
+concurrency:
+  group: despliegue-servidor
+  cancel-in-progress: false
+
+jobs:
+  desplegar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar acceso SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Enviar el código al servidor
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_deploy -o BatchMode=yes" \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude 'data' \
+            --exclude 'jk-anime-streamflix-bot*' \
+            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/streamflix/jk-anime-launcher/
+
+      - name: Reconstruir la imagen y comprobar
+        run: |
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "/opt/streamflix/deploy.sh bot"

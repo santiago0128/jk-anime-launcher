@@ -1,0 +1,6 @@
+node_modules
+.git
+data
+*.log
+.DS_Store
+jk-anime-streamflix-bot*

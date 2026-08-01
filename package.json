@@ -20,7 +20,8 @@
     "assets": [
       "README.md",
       "import_series_to_streamflix.js",
-      "save_episode_url_to_streamflix.js"
+      "save_episode_url_to_streamflix.js",
+      "save_pelisplus_to_streamflix.js"
     ]
   }
 }

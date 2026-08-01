@@ -1,11 +1,27 @@
 #!/usr/bin/env node
 
 const https = require('https');
+const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
 const { main: saveEpisode } = require('./save_episode_url_to_streamflix.js');
+const {
+  main: importPelisplus,
+  searchTitleAcrossSites,
+  buildTitleUrl
+} = require('./save_pelisplus_to_streamflix.js');
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const JKANIME_BASE_URL = 'https://jkanime.net/';
+const PELISPLUS_HOME_URL = 'https://ww9.cuevana3.to/';
+// Si un titulo no aparece en el sitio principal se busca en los demas, en orden.
+// Agregar uno nuevo aqui solo funciona si tiene adaptador en
+// save_pelisplus_to_streamflix.js, que es quien sabe leer su HTML.
+const CONTENT_SITES = [PELISPLUS_HOME_URL, 'https://www.pelisplushd.la/'];
+const PELISPLUS_PATH_BY_TYPE = {
+  series: 'serie',
+  movie: 'pelicula'
+};
 function parseArgs(argv) {
   const args = {};
 
@@ -13,12 +29,26 @@ function parseArgs(argv) {
     const token = argv[i];
     if (!token.startsWith('--')) continue;
     const key = token.slice(2);
-    const value = argv[i + 1];
-    args[key] = value;
+    const next = argv[i + 1];
+
+    // Un flag sin valor (--no-browser) no debe comerse el siguiente parametro.
+    if (next === undefined || next.startsWith('--')) {
+      args[key] = 'true';
+      continue;
+    }
+
+    args[key] = next;
     i += 1;
   }
 
   return args;
+}
+
+// En segundo plano no se abre el navegador: la pestaña emergente es justo lo que
+// interrumpe cuando la importacion corre desatendida.
+function shouldOpenBrowser(args) {
+  if (process.env.JK_NO_BROWSER === '1') return false;
+  return args['no-browser'] !== 'true' && args['no-browser'] !== true;
 }
 
 function fetchText(url, options = {}, redirectCount = 0) {
@@ -142,6 +172,51 @@ function episodeUrl(baseSeriesUrl, episodeNumber) {
   return `${normalized}${episodeNumber}/`;
 }
 
+function openUrlInBrowser(url) {
+  const openers = process.platform === 'darwin'
+    ? [['open', [url]]]
+    : process.platform === 'win32'
+      ? [['cmd', ['/c', 'start', '', url]]]
+      : [['xdg-open', [url]]];
+
+  for (const [command, args] of openers) {
+    try {
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore'
+      });
+      child.unref();
+      return true;
+    } catch {
+      continue;
+    }
+  }
+
+  return false;
+}
+
+// El buscador y el armado de URL dependen del sitio configurado en
+// PELISPLUS_HOME_URL, asi que los resuelve el importador, que es quien conoce
+// el HTML de cada uno.
+function buildPelisplusUrl(contentType, title) {
+  return (
+    buildTitleUrl({ baseUrl: PELISPLUS_HOME_URL, contentType, title }) || PELISPLUS_HOME_URL
+  );
+}
+
+function findOnPelisplus(contentType, title) {
+  if (!PELISPLUS_PATH_BY_TYPE[contentType]) return Promise.resolve({ attempts: [] });
+  return searchTitleAcrossSites({ contentType, title, baseUrls: CONTENT_SITES });
+}
+
+function getBrowserTargetUrl(contentType, animeUrl = null, title = null) {
+  if (contentType === 'anime') {
+    return animeUrl || JKANIME_BASE_URL;
+  }
+
+  return buildPelisplusUrl(contentType, title);
+}
+
 async function findSeriesOnJkAnime(seriesName) {
   const searchUrl = `https://jkanime.net/buscar?q=${encodeURIComponent(seriesName)}`;
   const html = await fetchText(searchUrl);
@@ -182,11 +257,24 @@ async function getSeriesMetadataFromUrl(seriesUrl) {
     html.match(/<li>\s*<span>\s*Episodios:\s*<\/span>\s*(\d+)\s*<\/li>/i) ||
     html.match(/<span>\s*Episodios:\s*<\/span>\s*(\d+)/i);
 
+  // En los animes en emision el campo "Episodios" viene en 0, asi que el numero
+  // real hay que sacarlo del enlace al ultimo episodio publicado.
+  const lastEpisodeMatch =
+    html.match(/href="https?:\/\/jkanime\.net\/[^"]+\/(\d+)\/"[^>]*id="uep"/i) ||
+    html.match(/id="uep"[^>]*>[^<]*?(\d+)\s*</i);
+
   const parsedUrl = new URL(normalizedUrl);
   const slug = parsedUrl.pathname.split('/').filter(Boolean)[0];
   const rawTitle = titleMatch ? cleanText(titleMatch[1]) : titleFromSlug(slug);
-  const title = rawTitle.replace(/\s+Sub Español.*$/i, '').trim();
-  const totalEpisodes = totalEpisodesMatch ? Number(totalEpisodesMatch[1]) : null;
+  // El <title> de la ficha viene con cola de SEO: "Nombre - anime Nombre online JkAnime".
+  const title = rawTitle
+    .replace(/\s+Sub Español.*$/i, '')
+    .replace(/\s*[-–]\s*anime\b.*$/i, '')
+    .replace(/\s*\|\s*JkAnime.*$/i, '')
+    .trim();
+  const declaredEpisodes = totalEpisodesMatch ? Number(totalEpisodesMatch[1]) : 0;
+  const lastEpisode = lastEpisodeMatch ? Number(lastEpisodeMatch[1]) : 0;
+  const totalEpisodes = Math.max(declaredEpisodes, lastEpisode) || null;
 
   if (!slug) {
     throw new Error(`No pude detectar el slug de la serie desde ${seriesUrl}`);
@@ -200,12 +288,37 @@ async function getSeriesMetadataFromUrl(seriesUrl) {
   };
 }
 
+// Los titulos de jkanime traen adornos que AniList no reconoce: "(Original)",
+// acentos, sufijos de temporada. Se prueban variantes de mas a menos especifica
+// hasta que una coincida.
+function aniListSearchVariants(seriesName) {
+  const base = cleanText(seriesName);
+  const withoutParens = base.replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim();
+  const withoutAccents = withoutParens.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const words = withoutAccents.split(' ').filter(Boolean);
+
+  const variants = [base, withoutParens, withoutAccents];
+  if (words.length > 2) variants.push(words.slice(0, 2).join(' '));
+
+  return [...new Set(variants.filter(Boolean))];
+}
+
 async function findAniListId(seriesName) {
+  for (const variant of aniListSearchVariants(seriesName)) {
+    const found = await queryAniList(variant);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+async function queryAniList(seriesName) {
   try {
     const query = `
       query ($search: String) {
         Media(search: $search, type: ANIME) {
           id
+          idMal
           title {
             romaji
             english
@@ -229,7 +342,8 @@ async function findAniListId(seriesName) {
     }
 
     return {
-      id: media.id,
+      id: media.idMal || null,
+      aniListId: media.id,
       releaseYear: media.seasonYear || null,
       rating: media.averageScore ? Number((media.averageScore / 10).toFixed(1)) : null,
       matchedTitle: media.title?.english || media.title?.romaji || media.title?.native || seriesName
@@ -251,41 +365,190 @@ function importEpisode(config, episodeNumber) {
   });
 }
 
+let promptInterface = null;
+
 function ask(question) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
+  if (!promptInterface) {
+    promptInterface = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+  }
 
   return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
+    promptInterface.question(question, (answer) => {
       resolve(answer.trim());
     });
   });
 }
 
+function closePrompts() {
+  if (promptInterface) {
+    promptInterface.close();
+    promptInterface = null;
+  }
+}
+
+function normalizeContentType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['anime', 'animes'].includes(normalized)) return 'anime';
+  if (['serie', 'series'].includes(normalized)) return 'series';
+  if (['pelicula', 'películas', 'peliculas', 'movie', 'movies'].includes(normalized)) return 'movie';
+  return null;
+}
+
 async function resolveInteractiveArgs(args) {
-  if (args['series-name'] || args['series-url']) {
+  if (args['series-name'] || args['series-url'] || args.title || args['page-url'] || args['content-type']) {
     return args;
   }
 
-  const seriesUrl = await ask('Pega la URL de la serie de JK Anime que quieres cargar en la base de datos: ');
-  if (!seriesUrl) {
-    throw new Error('No enviaste una URL de serie.');
+  // Sin terminal no hay quien conteste las preguntas: mejor avisar que quedarse
+  // esperando en silencio, que es lo que pasaria corriendo en segundo plano.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      'No hay terminal para preguntar. En segundo plano pasa los datos por parametro, ' +
+        'por ejemplo: --content-type serie --title "Stranger Things" --no-browser'
+    );
   }
+
+  const rawType = await ask('¿Qué quieres cargar? [anime/serie/pelicula]: ');
+  const contentType = normalizeContentType(rawType);
+  if (!contentType) {
+    throw new Error('Debes elegir anime, serie o pelicula.');
+  }
+
+  if (contentType === 'anime') {
+    const animeInput = await ask('Pega la URL o el nombre del anime que quieres cargar: ');
+    if (!animeInput) {
+      throw new Error('No enviaste el nombre o la URL del anime.');
+    }
+
+    if (/^https?:\/\//i.test(animeInput)) {
+      return {
+        ...args,
+        interactive: true,
+        'content-type': contentType,
+        'series-url': animeInput
+      };
+    }
+
+    return {
+      ...args,
+      interactive: true,
+      'content-type': contentType,
+      'series-name': animeInput
+    };
+  }
+
+  const label = contentType === 'movie' ? 'pelicula' : 'serie';
+  const input = await ask(`Escribe el nombre de la ${label} (o pega la URL de PelisPlusHD): `);
+  if (!input) {
+    throw new Error(`No enviaste el nombre de la ${label}.`);
+  }
+
+  const target = /^https?:\/\//i.test(input) ? { 'page-url': input } : { title: input };
+
+  if (contentType !== 'series') {
+    return { ...args, 'content-type': contentType, ...target };
+  }
+
+  // Una serie completa puede ser medio centenar de capitulos y cada uno es una
+  // descarga, asi que se deja elegir la temporada antes de arrancar.
+  const season = await ask('¿Qué temporada quieres importar? (Enter = todas): ');
 
   return {
     ...args,
-    'series-url': seriesUrl
+    'content-type': contentType,
+    ...target,
+    ...(season ? { season } : {})
   };
 }
 
 async function main() {
   const rawArgs = parseArgs(process.argv.slice(2));
-  const args = await resolveInteractiveArgs(rawArgs);
+  const args = await resolveInteractiveArgs(rawArgs).finally(closePrompts);
+  const contentType = normalizeContentType(args['content-type'] || 'anime') || 'anime';
   const seriesName = args['series-name'];
   const seriesUrlArg = args['series-url'];
+  const titleArg = args.title;
+  const pageUrlArg = args['page-url'];
+
+  if (contentType !== 'anime') {
+    const label = contentType === 'movie' ? 'pelicula' : 'serie';
+    if (!titleArg && !pageUrlArg) {
+      throw new Error(`Debes enviar --title "Nombre de la ${label}" o --page-url "https://www.pelisplushd.la/${label}/slug".`);
+    }
+
+    const search = titleArg
+      ? await findOnPelisplus(contentType, titleArg).catch(() => ({ attempts: [] }))
+      : { attempts: [] };
+    let match = search.url ? search : null;
+
+    // Un parecido no es un acierto: sin confirmar, importar "Stealing Pulp
+    // Fiction" cuando pediste "Pulp Fiction" es peor que no importar nada.
+    if (match && !match.strong && !pageUrlArg) {
+      if (args['accept-similar'] === 'true') {
+        process.stderr.write(`≈ Uso el parecido "${match.title}" (${match.score.toFixed(2)}) de ${match.baseUrl}\n`);
+      } else if (args.interactive) {
+        const answer = await ask(
+          `No encontré "${titleArg}" exacto. El más parecido es "${match.title}" en ${match.baseUrl}. ¿Lo importo? [s/N]: `
+        ).finally(closePrompts);
+        if (!/^s(i|í)?$/i.test(answer)) {
+          throw new Error('Cancelado: no se importó nada.');
+        }
+      } else {
+        throw new Error(
+          `No encontré "${titleArg}" exacto como ${label}. Lo más parecido es "${match.title}" ` +
+            `(${match.score.toFixed(2)}) en ${match.baseUrl}.\n` +
+            'Si es lo que buscas, repite con --accept-similar, o pasa la ficha con --page-url.'
+        );
+      }
+    }
+
+    if (titleArg && !match && !pageUrlArg) {
+      const detail = search.attempts.map((item) => `  · ${item.baseUrl}: ${item.reason}`).join('\n');
+      throw new Error(
+        `No encontre "${titleArg}" como ${label} en ninguno de los sitios configurados.\n${detail}\n` +
+          'Prueba con otro nombre, o pasa la ficha directo con --page-url.'
+      );
+    }
+
+    const targetUrl = pageUrlArg || match?.url || getBrowserTargetUrl(contentType, null, titleArg);
+    if (shouldOpenBrowser(args)) openUrlInBrowser(targetUrl);
+
+    const result = await importPelisplus({
+      pageUrl: targetUrl,
+      baseUrl: match?.baseUrl || PELISPLUS_HOME_URL,
+      contentType,
+      season: args.season,
+      start: args.start,
+      end: args.end,
+      emitJson: false,
+      onProgress: (event) =>
+        process.stderr.write(
+          `→ T${event.seasonNumber}E${event.episodeNumber} (${event.provider})${
+            event.total ? ` [${event.done}/${event.total}]` : ''
+          }\n`
+        )
+    });
+
+    console.log(
+      JSON.stringify(
+        {
+          ...result,
+          searchedTitle: titleArg || null,
+          matchedTitle: match?.title || null,
+          matchedInSearch: Boolean(match),
+          matchedSite: match?.baseUrl || null,
+          matchScore: match?.score != null ? Number(match.score.toFixed(2)) : null,
+          openedUrl: targetUrl
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
 
   let start = Number(args.start || 1);
   let end = Number(args.end || start);
@@ -297,13 +560,36 @@ async function main() {
   let jkSeries;
   if (seriesUrlArg) {
     jkSeries = await getSeriesMetadataFromUrl(seriesUrlArg);
-    if (!args.end && jkSeries.totalEpisodes) {
-      end = jkSeries.totalEpisodes;
-    }
   } else if (seriesName) {
-    jkSeries = await findSeriesOnJkAnime(seriesName);
+    // Buscar por nombre solo devuelve la ficha; hay que abrirla para saber
+    // cuantos capitulos tiene, si no se importaba siempre uno solo.
+    const found = await findSeriesOnJkAnime(seriesName);
+    jkSeries = await getSeriesMetadataFromUrl(found.url);
   } else {
     throw new Error('Debes enviar --series-name "Nombre de la serie" o --series-url "https://jkanime.net/serie/".');
+  }
+
+  if (!args.end && jkSeries.totalEpisodes) {
+    end = jkSeries.totalEpisodes;
+  }
+
+  // Importar una serie larga son cientos de descargas, asi que en modo
+  // interactivo se muestra lo detectado y se deja recortar antes de arrancar.
+  if (args.interactive && !args.end) {
+    const detected = jkSeries.totalEpisodes;
+    const answer = await ask(
+      detected
+        ? `Detecté ${detected} capítulos en "${jkSeries.title}". ¿Hasta cuál importo? (Enter = todos): `
+        : `No pude detectar cuántos capítulos tiene "${jkSeries.title}". ¿Hasta cuál importo? (Enter = solo el ${start}): `
+    ).finally(closePrompts);
+
+    if (answer) {
+      const requested = Number(answer);
+      if (!Number.isInteger(requested) || requested < start) {
+        throw new Error(`"${answer}" no es un capítulo válido (debe ser un entero >= ${start}).`);
+      }
+      end = requested;
+    }
   }
 
   const aniList = await findAniListId(jkSeries.title || seriesName || titleFromSlug(jkSeries.slug));
@@ -317,17 +603,39 @@ async function main() {
     rating: aniList?.rating || null
   };
 
+  if (shouldOpenBrowser(args)) openUrlInBrowser(getBrowserTargetUrl(contentType, config.seriesUrl));
+
   const imported = [];
+  const failed = [];
+  const total = end - start + 1;
+
   for (let episodeNumber = start; episodeNumber <= end; episodeNumber += 1) {
-    const result = await importEpisode(config, episodeNumber);
-    imported.push({
-      episodeNumber,
-      episodeId: result.episodeId,
-      snapshotId: result.snapshotId,
-      primaryVideoUrl: result.savedPrimaryVideoUrl,
-      primaryVideoSource: result.savedPrimaryVideoSource,
-      durationSec: result.durationSec
-    });
+    // Un capitulo caido no puede llevarse por delante el resto de la serie.
+    try {
+      const result = await importEpisode(config, episodeNumber);
+      imported.push({
+        episodeNumber,
+        episodeId: result.episodeId,
+        snapshotId: result.snapshotId,
+        primaryVideoUrl: result.savedPrimaryVideoUrl,
+        primaryVideoSource: result.savedPrimaryVideoSource,
+        durationSec: result.durationSec
+      });
+      process.stderr.write(`→ capítulo ${episodeNumber} [${imported.length + failed.length}/${total}]\n`);
+    } catch (error) {
+      failed.push({ episodeNumber, reason: error.message || String(error) });
+      process.stderr.write(
+        `✗ capítulo ${episodeNumber} [${imported.length + failed.length}/${total}]: ${error.message || error}\n`
+      );
+    }
+  }
+
+  if (!imported.length) {
+    throw new Error(
+      `No pude importar ningún capítulo de "${config.seriesName}".${
+        failed[0] ? ` Motivo del primero: ${failed[0].reason}` : ''
+      }`
+    );
   }
 
   console.log(
@@ -342,7 +650,9 @@ async function main() {
         rating: config.rating,
         importedRange: { start, end },
         importedCount: imported.length,
-        imported
+        failedCount: failed.length,
+        imported,
+        failed
       },
       null,
       2

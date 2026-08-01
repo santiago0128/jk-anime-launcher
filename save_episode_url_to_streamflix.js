@@ -53,6 +53,9 @@ const ANISKIP_CLIENT_ID = 'ZGfO0sMF3eCwLYf8yMSCJjlynwNGRXWE';
 const DEFAULT_EPISODE_LENGTH_SEC = 24 * 60;
 const NO_VIDEO_FOUND = 'NO_VIDEO_FOUND';
 const TRANSIENT_HTTP_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504, 520, 521, 522, 524]);
+// Algunos servidores de video aceptan la conexion y no responden nunca. Sin este
+// tope una sola peticion deja colgada la importacion entera.
+const REQUEST_TIMEOUT_MS = 20000;
 let runtimeConfig = null;
 
 function buildRuntimeConfig(overrides = {}) {
@@ -62,11 +65,14 @@ function buildRuntimeConfig(overrides = {}) {
   const releaseYearRaw = overrides.releaseYear != null ? overrides.releaseYear : process.env.JK_RELEASE_YEAR;
   const ratingRaw = overrides.rating != null ? overrides.rating : process.env.JK_RATING;
 
+  // Sin valores por defecto: antes caian los de Dragon Ball Z (id 813, 1989, 9.0)
+  // y cualquier anime al que le faltara el dato terminaba con SU intro, SU año y
+  // SU calificacion. Es preferible quedarse sin marcas que con las de otra serie.
   return {
     episodeUrl,
-    aniskipAnimeId: aniskipAnimeIdRaw != null && aniskipAnimeIdRaw !== '' ? Number(aniskipAnimeIdRaw) : 813,
-    releaseYear: releaseYearRaw != null && releaseYearRaw !== '' ? Number(releaseYearRaw) : 1989,
-    rating: ratingRaw != null && ratingRaw !== '' ? Number(ratingRaw) : 9.0
+    aniskipAnimeId: aniskipAnimeIdRaw != null && aniskipAnimeIdRaw !== '' ? Number(aniskipAnimeIdRaw) : null,
+    releaseYear: releaseYearRaw != null && releaseYearRaw !== '' ? Number(releaseYearRaw) : null,
+    rating: ratingRaw != null && ratingRaw !== '' ? Number(ratingRaw) : null
   };
 }
 
@@ -181,7 +187,11 @@ function parseEpisodeData(html) {
   );
   const totalEpisodesText = matchOne(html, /<span class="d-block">(\d+)\s+episodios<\/span>/i);
   const seriesSynopsis = matchOne(html, /<span class="d-block">\d+\s+episodios<\/span>\s*<p class="d-block mt-2">([\s\S]*?)<\/p>/i);
-  const posterUrl = matchOne(html, /<img src="([^"]+)" alt="Dragon Ball Z \(Original\)">/i);
+  // El poster vive en el bloque video_t de la ficha; antes se buscaba por el alt
+  // de Dragon Ball, asi que el resto de los animes quedaba sin portada.
+  const posterUrl =
+    matchOne(html, /<div class="video_t">\s*<a href="[^"]*">\s*<img src="([^"]+)"/i) ||
+    matchOne(html, /<img src="(https?:\/\/[^"]*\/assets\/images\/animes\/image\/[^"]+)"/i);
   const nextEpisodeUrl = matchOne(html, /<a class="ml-1\s+w-100\s+" href="([^"]+)"><div class="btn btn-primary mt-1 videonav w-100">Siguiente/i);
   const previousEpisodeUrl = matchOne(html, /<a class="mr-1\s+w-100\s+" href="([^"]+)"><div class="btn btn-primary mt-1 videonav w-100">Anterior/i);
   const { episodeUrl } = getRuntimeConfig();
@@ -305,6 +315,7 @@ async function fetchEpisodeHtml(attempt = 1) {
       const request = https.get(
         episodeUrl,
         {
+          timeout: REQUEST_TIMEOUT_MS,
           headers: {
             'User-Agent': USER_AGENT,
             Accept: 'text/html,application/xhtml+xml'
@@ -330,10 +341,15 @@ async function fetchEpisodeHtml(attempt = 1) {
         }
       );
 
+      request.on('timeout', () => {
+        const error = new Error(`Tiempo de espera agotado (${REQUEST_TIMEOUT_MS} ms) cargando ${episodeUrl}`);
+        error.timedOut = true;
+        request.destroy(error);
+      });
       request.on('error', reject);
     });
   } catch (error) {
-    if (attempt < 4 && TRANSIENT_HTTP_STATUS_CODES.has(error.statusCode)) {
+    if (attempt < 4 && (error.timedOut || TRANSIENT_HTTP_STATUS_CODES.has(error.statusCode))) {
       await sleep(500 * attempt);
       return fetchEpisodeHtml(attempt + 1);
     }
@@ -353,6 +369,7 @@ async function requestUrl(method, url, headers = {}, redirectCount = 0) {
       url,
       {
         method,
+        timeout: REQUEST_TIMEOUT_MS,
         headers: {
           'User-Agent': USER_AGENT,
           ...headers
@@ -397,6 +414,9 @@ async function requestUrl(method, url, headers = {}, redirectCount = 0) {
       }
     );
 
+    request.on('timeout', () => {
+      request.destroy(new Error(`Tiempo de espera agotado (${REQUEST_TIMEOUT_MS} ms) para ${url}`));
+    });
     request.on('error', reject);
     request.end();
   });
@@ -732,6 +752,7 @@ async function ensureSeries(pool, episodeData) {
       .input('backdropUrl', episodeData.ogImageUrl)
       .input('releaseYear', releaseYear)
       .input('rating', rating)
+      .input('contentType', 'anime')
       .input('sourceRef', `jkanime:${episodeData.seriesSlug}`)
       .query(`
         UPDATE dbo.Series
@@ -742,6 +763,7 @@ async function ensureSeries(pool, episodeData) {
           BackdropUrl = @backdropUrl,
           ReleaseYear = @releaseYear,
           Rating = @rating,
+          ContentType = @contentType,
           SourceRef = @sourceRef
         WHERE Id = @id
       `);
@@ -757,6 +779,7 @@ async function ensureSeries(pool, episodeData) {
     .input('backdropUrl', episodeData.ogImageUrl)
     .input('releaseYear', releaseYear)
     .input('rating', rating)
+    .input('contentType', 'anime')
     .input('sourceRef', `jkanime:${episodeData.seriesSlug}`)
     .query(`
       INSERT INTO dbo.Series (
@@ -766,6 +789,7 @@ async function ensureSeries(pool, episodeData) {
         BackdropUrl,
         ReleaseYear,
         Rating,
+        ContentType,
         SourceRef
       )
       OUTPUT INSERTED.Id
@@ -776,6 +800,7 @@ async function ensureSeries(pool, episodeData) {
         @backdropUrl,
         @releaseYear,
         @rating,
+        @contentType,
         @sourceRef
       )
     `);
@@ -1147,6 +1172,15 @@ async function main(options = {}) {
   const episodeData = parseEpisodeData(html);
   const verificationData = await resolveVerifiedVideo(episodeData);
   Object.assign(episodeData, verificationData);
+
+  // Se comprueba antes de tocar la base: si ningun servidor entrego un video
+  // reproducible, guardar la fila solo mete un episodio muerto en el catalogo.
+  if (!episodeData.verifiedVideoUrl || episodeData.verifiedVideoUrl === NO_VIDEO_FOUND) {
+    throw new Error(
+      `Ningun servidor entrego un video reproducible para ${episodeData.episodePageUrl}` +
+        ` (se probaron ${episodeData.verificationAttempts?.length || 0} fuentes). No se guardo nada.`
+    );
+  }
   const timingData = await fetchAniSkipTimings(episodeData.episodeNumber);
 
   const pool = await getPool();
@@ -1209,4 +1243,37 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+// Los helpers de red y de conexion se comparten con el importador de PelisPlusHD
+// para no duplicar la logica de verificacion de video ni la del pool.
+async function closePool() {
+  if (!poolPromise) {
+    return;
+  }
+
+  const pending = poolPromise;
+  poolPromise = null;
+  const pool = await pending.catch(() => null);
+  if (pool) {
+    await pool.close();
+  }
+}
+
+module.exports = {
+  main,
+  getPool,
+  closePool,
+  requestUrl,
+  fetchText,
+  probeVideoUrl,
+  extractMediaUrlsFromHtml,
+  normalizeUrl,
+  looksLikeVideoFile,
+  isVideoContentType,
+  cleanText,
+  decodeHtml,
+  matchOne,
+  matchAll,
+  sleep,
+  USER_AGENT,
+  NO_VIDEO_FOUND
+};
