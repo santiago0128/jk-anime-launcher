@@ -11,8 +11,40 @@
 //   node completar_metadatos.js            solo enseña lo que haría
 //   node completar_metadatos.js --aplicar  escribe en la base
 
-const { getPool, closePool } = require('./save_episode_url_to_streamflix.js');
+const { getPool, closePool, fetchText } = require('./save_episode_url_to_streamflix.js');
+const { resolveAdapter, buildTitleUrl } = require('./save_pelisplus_to_streamflix.js');
 const { buscarFicha } = require('./fuentes_catalogo.js');
+
+// Misma lista y mismo orden que el importador. Un sitio puede tener la ficha
+// —con su portada y su sinopsis en español— aunque no tenga video que
+// funcione, y hasta ahora esa página se descartaba entera junto con el vídeo
+// que le faltaba.
+const SITIOS = ['https://ww9.cuevana3.to/', 'https://www.pelisplushd.la/', 'https://www2.gnula.one/'];
+
+async function buscarEnLosSitios(titulo, contentType) {
+  const tipo = contentType === 'series' ? 'series' : 'movie';
+
+  for (const baseUrl of SITIOS) {
+    try {
+      const url = buildTitleUrl({ baseUrl, contentType: tipo, title: titulo });
+      if (!url) continue;
+
+      const html = await fetchText(url);
+      const ficha = resolveAdapter(url).parseTitleMetadata(html, url);
+      if (ficha?.posterUrl || ficha?.synopsis) {
+        return {
+          posterUrl: ficha.posterUrl || null,
+          sinopsis: ficha.synopsis || null,
+          fuente: new URL(baseUrl).hostname
+        };
+      }
+    } catch {
+      // Ese sitio no la tiene o no respondió: se prueba el siguiente.
+    }
+  }
+
+  return null;
+}
 
 const aplicar = process.argv.includes('--aplicar');
 
@@ -41,9 +73,13 @@ async function main() {
       if (!fila.PosterUrl) falta.push('portada');
       if (!fila.Description) falta.push('sinopsis');
 
+      const esAnime = fila.ContentType === 'anime';
       let ficha = null;
       try {
-        ficha = await buscarFicha({ titulo: fila.Title, tipo: fila.ContentType === 'anime' ? 'anime' : 'cine' });
+        // Primero los sitios de la cadena, que traen el dato en español y con
+        // el mismo título que se importó. AniList y Wikidata cubren el resto.
+        if (!esAnime) ficha = await buscarEnLosSitios(fila.Title, fila.ContentType);
+        if (!ficha) ficha = await buscarFicha({ titulo: fila.Title, tipo: esAnime ? 'anime' : 'cine' });
       } catch (error) {
         console.log(`  #${fila.Id} ${fila.Title} — no pude consultar: ${error.message}`);
         continue;
