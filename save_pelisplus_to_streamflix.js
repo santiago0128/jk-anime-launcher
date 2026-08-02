@@ -27,8 +27,10 @@ const HTML_ACCEPT = 'text/html,application/xhtml+xml';
 // Abrir cada embed de terceros para buscar el archivo real es caro, asi que solo
 // se hace con los primeros candidatos; el resto queda guardado como embed.
 const MAX_DEEP_RESOLVE_CANDIDATES = 6;
-// Hosts de la familia streamwish: son los que publican el m3u8 en el jwplayer
-// empaquetado, asi que se intentan antes que el resto.
+// Hosts que publican el m3u8 en un jwplayer empaquetado, asi que se intentan
+// antes que el resto. La familia streamwish es la mayoritaria; uqload usa la
+// misma plantilla (embed-XXXX.html) y sirve igual de bien, pero solo cuando no
+// se le manda Referer (ver fetchPlayerMediaUrls).
 const RESOLVABLE_HOST_HINTS = [
   'filelions',
   'vidhide',
@@ -37,7 +39,8 @@ const RESOLVABLE_HOST_HINTS = [
   'wish',
   'lulustream',
   'dhcplay',
-  'smoothpre'
+  'smoothpre',
+  'uqload'
 ];
 
 function resolvePriority(url) {
@@ -917,6 +920,33 @@ function unpackPackedScript(source) {
   return unpacked;
 }
 
+// Algunos hosts (uqload y compania) solo sirven el reproductor cuando el dominio
+// que lo embebe esta en su lista; a cualquier otro le devuelven un aviso de dos
+// lineas. Como aqui no somos el sitio que lo embebe, mandar el Referer de la
+// ficha es justo lo que hace que nos rechacen: sin el, entregan el jwplayer
+// empaquetado igual que el resto. Se sigue intentando primero CON Referer,
+// porque hay hosts que exigen lo contrario, y solo se reintenta sin el cuando la
+// primera pasada no saca nada.
+async function fetchPlayerMediaUrls(embedUrl, pageUrl) {
+  const intentos = [{ Accept: HTML_ACCEPT, Referer: pageUrl }, { Accept: HTML_ACCEPT }];
+
+  for (const headers of intentos) {
+    let html;
+    try {
+      html = await fetchText(embedUrl, headers);
+    } catch (error) {
+      // El primer intento manda: si el host no responde, que lo trate el llamador.
+      if (headers.Referer) throw error;
+      continue;
+    }
+
+    const urls = extractPlayerMediaUrls(html, embedUrl);
+    if (urls.length) return urls;
+  }
+
+  return [];
+}
+
 // El player hace sources:[{file: links.hls4||links.hls3||links.hls2}], asi que se
 // respeta ese mismo orden: el primero es el del propio host y es el que responde.
 function extractPlayerMediaUrls(html, pageUrl) {
@@ -1012,8 +1042,7 @@ async function resolveVerifiedVideo(playerOptions, pageUrl) {
     deepResolveBudget -= 1;
 
     try {
-      const html = await fetchText(candidate.url, { Accept: HTML_ACCEPT, Referer: pageUrl });
-      const extractedMediaUrls = extractPlayerMediaUrls(html, candidate.url);
+      const extractedMediaUrls = await fetchPlayerMediaUrls(candidate.url, pageUrl);
 
       for (const extractedMediaUrl of extractedMediaUrls) {
         const verified = await probeVideoUrl(extractedMediaUrl, { Referer: candidate.url });
