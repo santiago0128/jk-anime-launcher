@@ -141,9 +141,13 @@ const ESQUEMA_INTENCION = {
       description: 'Qué clase de pedido es.'
     },
     busqueda: { type: 'string', description: 'El nombre a buscar, sin adornos: "Christopher Nolan", "El Padrino", "Ghibli".' },
-    rol: { type: 'string', enum: ['director', 'actor', ''], description: 'Solo si intencion es persona.' }
+    rol: { type: 'string', enum: ['director', 'actor', ''], description: 'Solo si intencion es persona.' },
+    matiz: {
+      type: 'string',
+      description: 'El tramo concreto que se pide dentro de la saga ("primera fase", "trilogía original"), o cadena vacía si se pide entera.'
+    }
   },
-  required: ['ambito', 'intencion', 'busqueda', 'rol'],
+  required: ['ambito', 'intencion', 'busqueda', 'rol', 'matiz'],
   additionalProperties: false
 };
 
@@ -159,12 +163,16 @@ const INSTRUCCIONES_INTENCION = [
   '  titulo   — se nombra una obra concreta ("Breaking Bad")',
   'busqueda: el nombre limpio a buscar, sin "todas las de" ni "películas de".',
   'rol: "director" o "actor" solo cuando intencion es persona; si no, cadena vacía.',
+  'matiz: si el pedido acota un tramo de la saga ("la primera fase", "la trilogía',
+  '  original"), cópialo tal cual y déjalo FUERA de busqueda. Si se pide todo, cadena vacía.',
   '',
-  'Ejemplos:',
-  '  "traeme todo lo que dirigio Christopher Nolan" -> cine / persona / Christopher Nolan / director',
-  '  "la trilogia de El Padrino" -> cine / saga / El Padrino / ""',
-  '  "todo boku no hero academia" -> anime / titulo / Boku no Hero Academia / ""',
-  '  "animes de deportes" -> anime / genero / Sports / ""'
+  'Ejemplos (ambito / intencion / busqueda / rol / matiz):',
+  '  "traeme todo lo que dirigio Christopher Nolan" -> cine / persona / Christopher Nolan / director / ""',
+  '  "la trilogia de El Padrino" -> cine / saga / El Padrino / "" / ""',
+  '  "toda la primera fase del MCU" -> cine / saga / MCU / "" / primera fase',
+  '  "la trilogia original de Star Wars" -> cine / saga / Star Wars / "" / trilogia original',
+  '  "todo boku no hero academia" -> anime / titulo / Boku no Hero Academia / "" / ""',
+  '  "animes de deportes" -> anime / genero / Sports / "" / ""'
 ].join('\n');
 
 function crearCliente() {
@@ -324,6 +332,7 @@ async function interpretarPedido(texto) {
       intencion: ['persona', 'saga', 'estudio', 'genero', 'titulo'].includes(datos.intencion) ? datos.intencion : 'titulo',
       busqueda,
       rol: datos.rol === 'actor' ? 'actor' : 'director',
+      matiz: String(datos?.matiz || '').trim(),
       interprete: respuesta.modelo
     };
   } catch {
@@ -355,7 +364,17 @@ function normalizar(datos) {
     vistos.add(clave);
 
     const anio = Number(fila?.anio) || null;
-    titulos.push({ titulo, tipo, anio: anio && anio > 1800 ? anio : null, nota: String(fila?.nota || '').trim() });
+    titulos.push({
+      titulo,
+      // Los nombres de repuesto solo los trae una fuente de datos; por el
+      // camino del modelo la lista va vacía y el importador prueba uno solo.
+      alternativos: (Array.isArray(fila?.alternativos) ? fila.alternativos : [])
+        .map((n) => String(n || '').trim())
+        .filter(Boolean),
+      tipo,
+      anio: anio && anio > 1800 ? anio : null,
+      nota: String(fila?.nota || '').trim()
+    });
     if (titulos.length >= MAX_TITULOS) break;
   }
 
@@ -413,9 +432,9 @@ async function expandirPedido(pedido) {
   return listarConElModelo(texto);
 }
 
-function describirIntencion({ ambito, intencion, busqueda, rol }) {
+function describirIntencion({ ambito, intencion, busqueda, rol, matiz }) {
   if (intencion === 'persona') return `Obra de ${busqueda} como ${rol}`;
-  if (intencion === 'saga') return `Saga ${busqueda}`;
+  if (intencion === 'saga') return matiz ? `Saga ${busqueda} — ${matiz}` : `Saga ${busqueda}`;
   if (intencion === 'estudio') return `Producciones de ${busqueda}`;
   if (intencion === 'genero') return `${ambito === 'anime' ? 'Anime' : 'Cine'} del género ${busqueda}`;
   return busqueda;

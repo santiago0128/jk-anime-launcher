@@ -188,7 +188,7 @@ const responder = (chatId, texto) => enviarMensaje(texto, { chatId }).catch((e) 
 
 // Lanza el importador como proceso aparte: si un título revienta, se lleva por
 // delante su propio proceso y no el bot.
-function importar(tipo, nombre) {
+function importarNombre(tipo, nombre) {
   return new Promise((resolve) => {
     const args =
       tipo === 'anime'
@@ -222,6 +222,26 @@ function importar(tipo, nombre) {
   });
 }
 
+// Un mismo título se llama distinto según el sitio: la fuente de datos da
+// "The Avengers" y pelisplus lo tiene como "Los Vengadores". Antes eso era un
+// fallo definitivo; ahora se prueban los demás nombres que trajo la fuente.
+// Se conserva el motivo del primer intento, que es el que el usuario pidió.
+//
+// Un /cancelar corta también aquí: si no, cada título en curso se llevaría por
+// delante todos sus reintentos antes de que el lote se entere.
+async function importar(tipo, nombre, alternativos = []) {
+  const primero = await importarNombre(tipo, nombre);
+  if (primero.ok) return primero;
+
+  for (const alterno of alternativos) {
+    if (lote?.cancelado) break;
+    const intento = await importarNombre(tipo, alterno);
+    if (intento.ok) return intento;
+  }
+
+  return primero;
+}
+
 function describirImportacion(resultado) {
   if (!resultado.ok) {
     return `❌ <b>${escaparHtml(resultado.titulo)}</b>\n${escaparHtml(resultado.motivo)}`;
@@ -252,7 +272,7 @@ async function correrLote(chatId) {
     lote.actual = item.titulo;
     const marca = `[${lote.indice}/${total}]`;
 
-    const resultado = await importar(item.tipo, item.titulo);
+    const resultado = await importar(item.tipo, item.titulo, item.alternativos);
     lote.resultados.push(resultado);
 
     await responder(
@@ -336,6 +356,7 @@ async function atender(mensaje) {
     if (!argumento) {
       return responder(chatId, ['Dime qué quieres traer, en tus palabras.', '', 'Ejemplos:',
         '<code>/pide la trilogía de El Padrino</code>',
+        '<code>/pide la primera fase del MCU</code>',
         '<code>/pide los animes clásicos de los 90</code>',
         '<code>/pide lo que dirigió Tarantino</code>'].join('\n'));
     }

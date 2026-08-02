@@ -72,6 +72,39 @@ const anio = (fecha) => {
   return n > 1800 ? n : null;
 };
 
+const sinAcentos = (texto) =>
+  String(texto || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+
+// Cada fuente conoce un título por varios nombres. Se quedan en orden de
+// preferencia y sin repetir, para que el importador pueda reintentar con el
+// siguiente cuando el primero no aparece en el sitio.
+//
+// Repetido es el mismo nombre salvo mayúsculas o acentos: "Capitán América: el
+// primer vengador" y "Capitán América: El primer vengador" son el mismo
+// intento de búsqueda, y probar los dos solo gasta tiempo.
+//
+// El tope existe porque cada reintento es una búsqueda entera por todos los
+// sitios: El Imperio contraataca tiene doce alias en Wikidata, y un lote de
+// cuarenta títulos que no existen no puede costar cuarenta veces doce.
+const MAX_NOMBRES = 4;
+
+function candidatos(nombres) {
+  const vistos = new Set();
+  const limpios = [];
+
+  for (const bruto of nombres) {
+    const nombre = String(bruto || '').trim();
+    if (!nombre) continue;
+    const clave = sinAcentos(nombre);
+    if (vistos.has(clave)) continue;
+    vistos.add(clave);
+    limpios.push(nombre);
+    if (limpios.length >= MAX_NOMBRES) break;
+  }
+
+  return limpios;
+}
+
 // ---------------------------------------------------------------- AniList
 
 // AniList no distingue "serie" de "película" como lo hace el importador: todo
@@ -80,8 +113,10 @@ const anio = (fecha) => {
 const FORMATO = { TV: 'TV', TV_SHORT: 'TV corta', MOVIE: 'película', OVA: 'OVA', ONA: 'ONA', SPECIAL: 'especial' };
 
 function deAniList(media) {
+  const nombres = candidatos([media.title?.romaji, media.title?.english, media.title?.native]);
   return {
-    titulo: media.title?.romaji || media.title?.english || media.title?.native,
+    titulo: nombres[0],
+    alternativos: nombres.slice(1),
     tipo: 'anime',
     anio: media.startDate?.year || null,
     nota: FORMATO[media.format] || ''
@@ -126,12 +161,7 @@ const GENEROS = {
 };
 
 function traducirGenero(genero) {
-  const llave = String(genero)
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
-    .trim();
-  return GENEROS[llave] || genero;
+  return GENEROS[sinAcentos(genero).trim()] || genero;
 }
 
 async function animesDeGenero(generoPedido, limite) {
@@ -167,10 +197,15 @@ function tmdb(ruta, parametros) {
   return pedirJson(tmdbUrl(ruta, parametros), { cabeceras });
 }
 
+// El título traducido va primero, pero el original queda de respaldo: hay
+// catálogos que nunca tradujeron la ficha y siguen listando el nombre de
+// estreno.
 function deTmdb(obra) {
   const esSerie = obra.media_type === 'tv' || Boolean(obra.first_air_date) || Boolean(obra.name);
+  const nombres = candidatos([obra.title, obra.name, obra.original_title, obra.original_name]);
   return {
-    titulo: obra.title || obra.name || obra.original_title || obra.original_name,
+    titulo: nombres[0],
+    alternativos: nombres.slice(1),
     tipo: esSerie ? 'serie' : 'pelicula',
     anio: anio(obra.release_date || obra.first_air_date),
     nota: ''
@@ -253,7 +288,8 @@ const PREFIJOS = [
   'PREFIX wdt: <http://www.wikidata.org/prop/direct/>',
   'PREFIX wd: <http://www.wikidata.org/entity/>',
   'PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>',
-  'PREFIX schema: <http://schema.org/>'
+  'PREFIX schema: <http://schema.org/>',
+  'PREFIX skos: <http://www.w3.org/2004/02/skos/core#>'
 ].join('\n');
 
 // De "instancia de" al tipo que entiende el importador.
@@ -283,12 +319,12 @@ function exigirQid(qid) {
   return qid;
 }
 
-async function resolverEntidad(nombre) {
+async function buscarEntidad(nombre, idioma) {
   const url = new URL(WIKIDATA_API);
   url.searchParams.set('action', 'wbsearchentities');
   url.searchParams.set('search', nombre);
-  url.searchParams.set('language', 'es');
-  url.searchParams.set('uselang', 'es');
+  url.searchParams.set('language', idioma);
+  url.searchParams.set('uselang', idioma);
   url.searchParams.set('format', 'json');
   url.searchParams.set('limit', '5');
 
@@ -296,15 +332,24 @@ async function resolverEntidad(nombre) {
   return datos?.search?.[0]?.id || null;
 }
 
+// La búsqueda va primero en español porque el pedido llega en español, pero
+// Wikidata tiene mucha más etiqueta en inglés: "Marvel Cinematic Universe
+// Phase One" existe y "primera fase del MCU" no encuentra nada. Sin este
+// segundo intento, media franquicia no resuelve.
+async function resolverEntidad(nombre) {
+  return (await buscarEntidad(nombre, 'es')) || (await buscarEntidad(nombre, 'en'));
+}
+
 // Todas las consultas devuelven lo mismo, así que el SELECT se escribe una vez
 // y cada intención solo aporta su patrón.
 function consultaDeObras(patron, orden = 'ORDER BY ?anio') {
-  return `SELECT ?obra (SAMPLE(?es) AS ?tEs) (SAMPLE(?wiki) AS ?tWiki) (SAMPLE(?en) AS ?tEn) (MIN(?a) AS ?anio) (SAMPLE(?clase) AS ?tipoObra) WHERE {
+  return `SELECT ?obra (SAMPLE(?es) AS ?tEs) (SAMPLE(?wiki) AS ?tWiki) (SAMPLE(?en) AS ?tEn) (GROUP_CONCAT(DISTINCT ?alias; SEPARATOR="§") AS ?tAlias) (MIN(?a) AS ?anio) (SAMPLE(?clase) AS ?tipoObra) WHERE {
   ${patron}
   ?obra wdt:P31 ?clase .
   VALUES ?clase { ${CLASES_SPARQL} }
   OPTIONAL { ?obra rdfs:label ?es . FILTER(LANG(?es) = "es") }
   OPTIONAL { ?obra rdfs:label ?en . FILTER(LANG(?en) = "en") }
+  OPTIONAL { ?obra skos:altLabel ?alias . FILTER(LANG(?alias) = "es") }
   OPTIONAL {
     ?articulo schema:about ?obra ; schema:isPartOf <https://es.wikipedia.org/> ; schema:name ?wiki .
   }
@@ -319,11 +364,23 @@ function consultaDeObras(patron, orden = 'ORDER BY ?anio') {
 // literalmente "The Godfather Part II", mientras que el artículo se llama
 // "El padrino II", que es como lo busca el importador en sitios en español.
 // Al artículo se le quita el paréntesis desambiguador, que no es del título.
+//
+// Aun así el primer nombre se queda corto más veces de las que parece: la
+// Wikipedia en español titula con el nombre de estreno en España, y para el
+// MCU eso es el inglés ("The Avengers", "The Incredible Hulk"). Los sitios que
+// raspa el importador son latinoamericanos y ahí esas dos son "Los Vengadores"
+// y "El increíble Hulk", que Wikidata sí guarda, pero como alias. Por eso se
+// devuelven todos los nombres: el importador prueba el siguiente si el
+// primero no aparece.
 function deWikidata(fila) {
   const clase = String(fila?.tipoObra?.value || '').split('/').pop();
   const wiki = String(fila?.tWiki?.value || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const alias = String(fila?.tAlias?.value || '').split('§');
+  const nombres = candidatos([wiki, fila?.tEs?.value, ...alias, fila?.tEn?.value]);
+
   return {
-    titulo: wiki || fila?.tEs?.value || fila?.tEn?.value || null,
+    titulo: nombres[0] || null,
+    alternativos: nombres.slice(1),
     tipo: CLASES[clase] || 'pelicula',
     anio: Number(fila?.anio?.value) || null,
     nota: ''
@@ -346,15 +403,98 @@ async function wikiPorPersona(busqueda, rol, limite) {
   return ordenarYRecortar(await qlever(consultaDeObras(`?obra wdt:${propiedad} wd:${qid} .`)), limite);
 }
 
+// Un pedido rara vez es la franquicia entera: "la primera fase del MCU" son 6
+// películas, no las 40 que cuelgan del universo. Wikidata tiene esos tramos
+// como entidades propias, pero no se llegan por nombre —"primera fase del MCU"
+// no encuentra nada— así que se listan los tramos de la franquicia y se
+// empareja el matiz contra sus etiquetas.
+//
+// El emparejamiento normaliza antes de comparar porque los dos lados dicen lo
+// mismo de formas distintas: el pedido llega como "primera fase" y la etiqueta
+// es "Anexo:Fase Uno del Universo cinematográfico de Marvel".
+const ORDINALES = {
+  primera: '1', primer: '1', primero: '1', uno: '1', una: '1', one: '1', i: '1',
+  segunda: '2', segundo: '2', dos: '2', two: '2', ii: '2',
+  tercera: '3', tercer: '3', tercero: '3', tres: '3', three: '3', iii: '3',
+  cuarta: '4', cuarto: '4', cuatro: '4', four: '4', iv: '4',
+  quinta: '5', quinto: '5', cinco: '5', five: '5', v: '5',
+  sexta: '6', sexto: '6', seis: '6', six: '6', vi: '6',
+  septima: '7', septimo: '7', siete: '7', seven: '7', vii: '7'
+};
+
+// Las palabras con las que se nombra un tramo, en los dos idiomas: la etiqueta
+// puede estar solo en inglés ("Star Wars original trilogy") y el pedido llega
+// siempre en español.
+const TRAMOS = {
+  phase: 'fase', trilogy: 'trilogia', season: 'temporada',
+  part: 'parte', saga: 'saga', series: 'serie'
+};
+
+// Ni "toda la primera fase" ni "la primera fase" deben diferenciarse: lo que
+// sobra se tira para que solo queden las palabras que identifican el tramo.
+const RELLENO = new Set([
+  'de', 'del', 'la', 'el', 'los', 'las', 'un', 'una', 'y', 'anexo',
+  'of', 'the', 'and', 'a',
+  'todo', 'toda', 'todos', 'todas', 'completa', 'completo', 'entera', 'entero'
+]);
+
+function palabrasClave(texto) {
+  return sinAcentos(texto)
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .map((p) => TRAMOS[p] || ORDINALES[p] || p)
+    .filter((p) => !RELLENO.has(p));
+}
+
+async function buscarSubserie(qid, matiz) {
+  const buscadas = palabrasClave(matiz);
+  if (!buscadas.length) return null;
+
+  // El + del camino es necesario: las fases del MCU no cuelgan del universo
+  // directamente, sino de "The Infinity Saga", que sí.
+  const filas = await qlever(`SELECT ?parte (SAMPLE(?es) AS ?tEs) (SAMPLE(?en) AS ?tEn) WHERE {
+  { ?parte wdt:P179+ wd:${qid} } UNION { wd:${qid} wdt:P527+ ?parte }
+  FILTER NOT EXISTS { ?parte wdt:P31 ?c . VALUES ?c { ${CLASES_SPARQL} } }
+  OPTIONAL { ?parte rdfs:label ?es . FILTER(LANG(?es) = "es") }
+  OPTIONAL { ?parte rdfs:label ?en . FILTER(LANG(?en) = "en") }
+} GROUP BY ?parte LIMIT 300`);
+
+  let mejor = null;
+  for (const fila of filas) {
+    for (const etiqueta of [fila?.tEs?.value, fila?.tEn?.value]) {
+      if (!etiqueta) continue;
+      const tiene = palabrasClave(etiqueta);
+      // Se exige el matiz entero: con "primera fase", "Fase Dos" no vale y
+      // "The Infinity Saga" tampoco. Entre los que encajan gana el de nombre
+      // más corto, que es el más específico.
+      if (!buscadas.every((p) => tiene.includes(p))) continue;
+      if (!mejor || tiene.length < mejor.largo) {
+        mejor = { qid: fila.parte.value.split('/').pop(), largo: tiene.length };
+      }
+    }
+  }
+
+  return mejor && /^Q\d+$/.test(mejor.qid) ? mejor.qid : null;
+}
+
 // "El Padrino" resuelve a la película de 1972, no a la saga; por eso se sale
 // de la obra hacia su serie y desde ahí se recogen todas las partes.
-async function wikiPorSaga(busqueda, limite) {
+async function wikiPorSaga(busqueda, limite, matiz = '') {
   const qid = exigirQid(await resolverEntidad(busqueda));
-  const porSerie = await qlever(consultaDeObras(`wd:${qid} wdt:P179 ?serie . ?obra wdt:P179 ?serie .`));
+  const raiz = (await buscarSubserie(qid, matiz)) || qid;
+
+  const porSerie = await qlever(consultaDeObras(`wd:${raiz} wdt:P179 ?serie . ?obra wdt:P179 ?serie .`));
   if (porSerie.length) return ordenarYRecortar(porSerie, limite);
 
   // Puede que el nombre ya apuntase a la serie en vez de a una de sus partes.
-  return ordenarYRecortar(await qlever(consultaDeObras(`?obra wdt:P179 wd:${qid} .`)), limite);
+  return ordenarYRecortar(await qlever(consultaDeObras(partesDe(raiz))), limite);
+}
+
+// Las dos formas de decir "esto pertenece a aquello". El MCU usa P179 para sus
+// películas pero P527 para colgar Iron Man de la Fase Uno, así que mirar solo
+// una deja títulos fuera.
+function partesDe(qid) {
+  return `{ ?obra wdt:P179 wd:${qid} } UNION { wd:${qid} wdt:P527 ?obra }`;
 }
 
 async function wikiPorEstudio(busqueda, limite) {
@@ -424,7 +564,7 @@ async function buscarFicha({ titulo, tipo }) {
 // Devuelve null cuando la fuente no aplica o no está configurada, para que
 // quien llama sepa que tiene que probar otra cosa en vez de dar por buena una
 // lista vacía.
-async function buscarEnFuentes({ ambito, intencion, busqueda, rol }, limite = 40) {
+async function buscarEnFuentes({ ambito, intencion, busqueda, rol, matiz = '' }, limite = 40) {
   if (!busqueda) return null;
 
   if (ambito === 'anime') {
@@ -444,7 +584,7 @@ async function buscarEnFuentes({ ambito, intencion, busqueda, rol }, limite = 40
 
   const fuente = 'Wikidata';
   if (intencion === 'persona') return { fuente, titulos: await wikiPorPersona(busqueda, rol, limite) };
-  if (intencion === 'saga') return { fuente, titulos: await wikiPorSaga(busqueda, limite) };
+  if (intencion === 'saga') return { fuente, titulos: await wikiPorSaga(busqueda, limite, matiz) };
   if (intencion === 'estudio') return { fuente, titulos: await wikiPorEstudio(busqueda, limite) };
   if (intencion === 'genero') return { fuente, titulos: await wikiPorGenero(busqueda, limite) };
   return { fuente, titulos: await wikiPorTitulo(busqueda, limite) };
