@@ -28,6 +28,10 @@
 //                       pide nada; con ella, de TMDB, que da mejores títulos.
 //   OLLAMA_URL          por defecto http://host.docker.internal:11434
 //   OLLAMA_MODELO       por defecto qwen2.5:1.5b
+//   OLLAMA_KEEP_ALIVE   cuánto se queda el modelo en memoria. Por defecto 30m,
+//                       para no pagar los ~5 s de carga en cada pedido.
+//   OLLAMA_MAX_TOKENS   techo de la respuesta. Por defecto 1200.
+//   OLLAMA_TIMEOUT_MS   por defecto 120000
 //   PEDIDO_MAX_TITULOS  tope de títulos por pedido (por defecto 40)
 
 const path = require('path');
@@ -47,6 +51,12 @@ const MAX_TITULOS = Number(process.env.PEDIDO_MAX_TITULOS) || 40;
 
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://host.docker.internal:11434').replace(/\/+$/, '');
 const OLLAMA_MODELO = process.env.OLLAMA_MODELO || 'qwen2.5:1.5b';
+const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '30m';
+const OLLAMA_MAX_TOKENS = Number(process.env.OLLAMA_MAX_TOKENS) || 1200;
+// Antes eran 5 minutos, heredados de cuando la respuesta no tenía techo. Con
+// num_predict acotado, pasar de esto significa que algo va mal (el modelo se
+// atascó, o la máquina está ahogada), y es mejor decirlo que seguir esperando.
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 120000;
 
 // El esquema obliga a que la respuesta venga ya parseable: sin él Claude
 // contesta en prosa y habría que adivinar dónde empieza cada título.
@@ -72,10 +82,14 @@ const ESQUEMA = {
             enum: TIPOS,
             description: 'anime para animación japonesa, serie para live action por temporadas, pelicula para largometrajes.'
           },
-          anio: { type: 'integer', description: 'Año de estreno; 0 si no se sabe.' },
-          nota: { type: 'string', description: 'Aclaración breve, o cadena vacía.' }
+          anio: { type: 'integer', description: 'Año de estreno; 0 si no se sabe.' }
+          // Aquí había un campo "nota". Lo pedía el esquema, lo rellenaba el
+          // modelo con una sinopsis de varias líneas por título... y no se
+          // enseñaba en ninguna parte. A 16 tokens/s en el servidor, eso era la
+          // mitad del tiempo de respuesta de /pide gastada en texto que nadie
+          // lee. Las fuentes siguen pudiendo aportar su propia nota.
         },
-        required: ['titulo', 'tipo', 'anio', 'nota'],
+        required: ['titulo', 'tipo', 'anio'],
         additionalProperties: false
       }
     }
@@ -229,7 +243,21 @@ function pedirAOllama(mensaje, instrucciones = INSTRUCCIONES_CORTAS, esquema = E
     model: OLLAMA_MODELO,
     stream: false,
     format: esquema,
-    options: { temperature: 0 },
+    // El servidor genera a ~16 tokens/s, así que cada token cuenta.
+    options: {
+      temperature: 0,
+      // Techo de salida. Con el esquema actual, 40 títulos entran de sobra en
+      // menos de mil tokens; esto solo está para que una respuesta que se
+      // desmadre falle rápido en vez de tener al usuario esperando minutos.
+      num_predict: OLLAMA_MAX_TOKENS,
+      // Explícito para no depender del valor por defecto de cada versión:
+      // el prompt ronda los 600 tokens y la salida no pasa del techo de arriba.
+      num_ctx: 4096
+    },
+    // Cargar el modelo cuesta unos 5 s. Con el valor por defecto (5 min) se
+    // paga de nuevo en cuanto pasa un rato entre dos peticiones, que es
+    // justo como se usa /pide. Ocupa 1 GB y solo se queda si se usa.
+    keep_alive: OLLAMA_KEEP_ALIVE,
     messages: [
       { role: 'system', content: instrucciones },
       { role: 'user', content: mensaje }
@@ -245,8 +273,7 @@ function pedirAOllama(mensaje, instrucciones = INSTRUCCIONES_CORTAS, esquema = E
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(cuerpo) },
-        // En CPU y con una lista larga puede tardar minutos.
-        timeout: 300000
+        timeout: OLLAMA_TIMEOUT_MS
       },
       (respuesta) => {
         let datos = '';
@@ -273,7 +300,14 @@ function pedirAOllama(mensaje, instrucciones = INSTRUCCIONES_CORTAS, esquema = E
       }
     );
 
-    peticion.on('timeout', () => peticion.destroy(new Error('Ollama tardó demasiado')));
+    peticion.on('timeout', () =>
+      peticion.destroy(
+        new Error(
+          `Ollama no contestó en ${Math.round(OLLAMA_TIMEOUT_MS / 1000)} s con el modelo ${OLLAMA_MODELO}. ` +
+          'Prueba a concretar más el pedido, o usa PEDIDO_PROVEEDOR=claude para este caso.'
+        )
+      )
+    );
     peticion.on('error', (error) =>
       reject(new Error(`No pude hablar con Ollama en ${OLLAMA_URL}: ${error.message}`))
     );

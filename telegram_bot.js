@@ -365,7 +365,9 @@ async function atender(mensaje) {
     await responder(chatId, '🤔 Pensando qué títulos son…');
 
     let propuesta;
-    ocupado = 'consultando a Claude';
+    // El motor por defecto es el modelo local, no Claude: decir "Claude" aquí
+    // confundía en /estado y en el aviso de "ya hay algo en curso".
+    ocupado = 'interpretando el pedido';
     try {
       propuesta = await expandirPedido(argumento);
     } catch (error) {
