@@ -373,6 +373,49 @@ async function wikiPorTitulo(busqueda, limite) {
   return ordenarYRecortar(await qlever(consultaDeObras(`BIND(wd:${qid} AS ?obra)`)), limite);
 }
 
+// --------------------------------------------------------------- portadas
+
+// Un titulo que entra por una fuente pobre en metadatos (Gnula devuelve la
+// ficha recortada; Pelismart va por embed) queda sin portada ni sinopsis. Los
+// datos si estan en las mismas fuentes que ya usa /pide, asi que se rellenan
+// desde ahi en vez de dejar la ficha coja.
+async function buscarFicha({ titulo, tipo }) {
+  if (!titulo) return null;
+
+  if (tipo === 'anime') {
+    const datos = await anilist(
+      'query ($b: String) { Media(search: $b, type: ANIME) { coverImage { extraLarge } description(asHtml: false) startDate { year } } }',
+      { b: titulo }
+    );
+    const media = datos?.Media;
+    if (!media) return null;
+    return {
+      posterUrl: media.coverImage?.extraLarge || null,
+      sinopsis: String(media.description || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() || null,
+      anio: media.startDate?.year || null,
+      fuente: 'AniList'
+    };
+  }
+
+  const qid = await resolverEntidad(titulo);
+  if (!qid || !/^Q\d+$/.test(qid)) return null;
+
+  // P18 es la imagen del articulo; Special:FilePath devuelve el archivo real.
+  const filas = await qlever(`SELECT ?img ?anio WHERE {
+  OPTIONAL { wd:${qid} wdt:P18 ?img }
+  OPTIONAL { wd:${qid} wdt:P577 ?f . BIND(YEAR(?f) AS ?anio) }
+} LIMIT 1`);
+  const fila = filas[0];
+  if (!fila) return null;
+
+  return {
+    posterUrl: fila?.img?.value || null,
+    sinopsis: null,
+    anio: Number(fila?.anio?.value) || null,
+    fuente: 'Wikidata'
+  };
+}
+
 // ------------------------------------------------------------- despachador
 
 // Devuelve null cuando la fuente no aplica o no está configurada, para que
@@ -406,6 +449,7 @@ async function buscarEnFuentes({ ambito, intencion, busqueda, rol }, limite = 40
 
 module.exports = {
   buscarEnFuentes,
+  buscarFicha,
   hayTmdb,
   animesDeFranquicia,
   porPersona,
