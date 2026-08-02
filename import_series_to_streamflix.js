@@ -18,7 +18,9 @@ const PELISPLUS_HOME_URL = 'https://ww9.cuevana3.to/';
 // Si un titulo no aparece en el sitio principal se busca en los demas, en orden.
 // Agregar uno nuevo aqui solo funciona si tiene adaptador en
 // save_pelisplus_to_streamflix.js, que es quien sabe leer su HTML.
-const CONTENT_SITES = [PELISPLUS_HOME_URL, 'https://www.pelisplushd.la/'];
+// Gnula va la ultima: solo tiene el reproductor incrustado, sin portada ni
+// sinopsis, asi que solo debe entrar cuando los demas no tienen video.
+const CONTENT_SITES = [PELISPLUS_HOME_URL, 'https://www.pelisplushd.la/', 'https://www2.gnula.one/'];
 const PELISPLUS_PATH_BY_TYPE = {
   series: 'serie',
   movie: 'pelicula'

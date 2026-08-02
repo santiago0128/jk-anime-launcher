@@ -97,6 +97,58 @@ function normalizePageUrl(url, baseUrl = PELISPLUS_BASE_URL) {
   return absolute.replace(/\/+$/, '');
 }
 
+// Gnula sirve dos cosas distintas segun quien pregunte: a un navegador le da la
+// ficha completa, y a un cliente HTTP pelado le devuelve una pagina recortada
+// cuyo <h1> es "Your IP: ...", sin portada, sinopsis, año ni generos. De ahi
+// solo se puede sacar el titulo y el reproductor, y por eso va la ultima de la
+// lista: solo entra cuando ningun otro sitio tiene video.
+function parseGnulaMetadata(html, pageUrl) {
+  const pageTitle = matchOne(html, /<title>([^<]+)<\/title>/i);
+  // El <title> viene como "Iron Man – G Nula".
+  const title = pageTitle ? cleanText(decodeHtml(pageTitle).replace(/\s*[–—-]\s*G\s*Nula\s*$/i, '')) : null;
+
+  return {
+    pageTitle,
+    metaDescription: null,
+    metaKeywords: null,
+    title: title || slugFromPageUrl(pageUrl),
+    rawHeading: title,
+    originalTitle: null,
+    synopsis: null,
+    posterUrl: null,
+    releaseYear: null,
+    rating: null,
+    genres: []
+  };
+}
+
+// El reproductor va en un iframe suelto; el resto de iframes de la pagina son
+// botones de redes sociales.
+function parseGnulaPlayers(html) {
+  return matchAll(html, /<iframe[^>]+src="(https:\/\/player\.[^"]+)"/g, (match) => ({
+    embedUrl: cleanText(decodeHtml(match[1])),
+    language: null,
+    server: 'Gnula'
+  })).map((item, index) => ({ index, ...item }));
+}
+
+const GNULA_ADAPTER = {
+  id: 'gnula',
+  sourceSite: 'Gnula',
+  contentTypeFromUrl: (pageUrl) => (/\/(?:serie|tv)\//i.test(pageUrl) ? 'series' : 'movie'),
+  buildTitleUrl: (baseUrl, contentType, slug) =>
+    normalizeUrl(`${contentType === 'series' ? 'serie' : 'movie'}/${slug}/`, baseUrl),
+  // Su buscador ignora la consulta: "?s=iron+man" devuelve el mismo listado que
+  // cualquier otra cosa. Se llega por URL directa o no se llega.
+  searchUrl: (baseUrl) => baseUrl,
+  parseSearchResults: () => [],
+  parseTitleMetadata: parseGnulaMetadata,
+  parseSeasonEpisodes: () => [],
+  parsePlayerOptions: parseGnulaPlayers,
+  parseEpisodeNavigation: () => ({}),
+  buildEpisodeTitle: (_meta, episode) => `Capitulo ${episode.episodeNumber}`
+};
+
 // Cada sitio tiene su propio HTML, asi que lo especifico de cada uno vive en un
 // adaptador y el resto del importador (video, base de datos) es comun.
 function resolveAdapter(url) {
@@ -107,6 +159,10 @@ function resolveAdapter(url) {
     hostname = String(url || '').toLowerCase();
   }
 
+  // Gnula va antes que la comprobacion de cuevana a proposito: su reproductor
+  // vive en player.cuevana.ac, y por el nombre acabaria en el adaptador que no
+  // es.
+  if (hostname.includes('gnula')) return GNULA_ADAPTER;
   return hostname.includes('cuevana') ? CUEVANA3_ADAPTER : PELISPLUS_ADAPTER;
 }
 
