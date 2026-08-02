@@ -401,9 +401,12 @@ async function buscarFicha({ titulo, tipo }) {
   if (!qid || !/^Q\d+$/.test(qid)) return null;
 
   // P18 es la imagen del articulo; Special:FilePath devuelve el archivo real.
+  // El VALUES ancla la consulta: un WHERE hecho solo de OPTIONAL no casa con
+  // ninguna fila y devuelve vacio aunque el dato exista.
   const filas = await qlever(`SELECT ?img ?anio WHERE {
-  OPTIONAL { wd:${qid} wdt:P18 ?img }
-  OPTIONAL { wd:${qid} wdt:P577 ?f . BIND(YEAR(?f) AS ?anio) }
+  VALUES ?obra { wd:${qid} }
+  OPTIONAL { ?obra wdt:P18 ?img }
+  OPTIONAL { ?obra wdt:P577 ?f . BIND(YEAR(?f) AS ?anio) }
 } LIMIT 1`);
   const fila = filas[0];
   if (!fila) return null;
