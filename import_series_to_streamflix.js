@@ -685,7 +685,16 @@ async function main() {
     if (pageUrlArg) {
       candidatos = [{ url: pageUrlArg, baseUrl: match?.baseUrl || PELISPLUS_HOME_URL }];
     } else if (match?.url) {
-      candidatos = [{ url: match.url, baseUrl: match.baseUrl }, ...(match.alternativas || [])];
+      // Los sitios sin buscador utilizable nunca aparecen entre los resultados,
+      // asi que se añaden por URL directa detras de los que si buscaron. Sin
+      // esto, un sitio como Gnula solo entraba cuando fallaban todos los
+      // buscadores a la vez, que es justo cuando menos falta hace.
+      const yaEstan = new Set([match.baseUrl, ...(match.alternativas || []).map((item) => item.baseUrl)]);
+      candidatos = [
+        { url: match.url, baseUrl: match.baseUrl },
+        ...(match.alternativas || []),
+        ...porUrlDirecta().filter((item) => !yaEstan.has(item.baseUrl))
+      ];
     } else {
       candidatos = porUrlDirecta();
     }
