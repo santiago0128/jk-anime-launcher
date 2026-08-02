@@ -118,8 +118,18 @@ function parsePelismartSearchResults(html, baseUrl) {
 function parsePelismartMetadata(html, pageUrl) {
   const pageTitle = matchOne(html, /<title>([^<]+)<\/title>/i);
   // "Ver Iron Man (2008) Online - PELISMART"
+  // "Ver Iron Man (2008) Online - PELISMART" -> "Iron Man (2008)". El "Online"
+  // va en medio, entre el año y el nombre del sitio, y se colaba en el titulo.
+  // En las series el <title> ademas trae "Temporada N Episodio M", que
+  // pertenece al capitulo y no a la serie.
   const limpio = pageTitle
-    ? cleanText(pageTitle.replace(/^\s*Ver\s+/i, '').replace(/\s*-\s*PELISMART\s*$/i, ''))
+    ? cleanText(
+        pageTitle
+          .replace(/^\s*Ver\s+/i, '')
+          .replace(/\s*-\s*PELISMART\s*$/i, '')
+          .replace(/\s*Online\s*$/i, '')
+          .replace(/\s*Temporada\s+\d+\s+Episodio\s+\d+\s*$/i, '')
+      )
     : null;
   const anio = limpio ? (limpio.match(/\((\d{4})\)/) || [])[1] : null;
 
