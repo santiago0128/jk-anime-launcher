@@ -156,6 +156,31 @@ function parsePelismartPlayers(html) {
   })).map((item, index) => ({ index, ...item }));
 }
 
+// La ficha de una serie lista todos sus capitulos con la temporada y el numero
+// en la propia URL, asi que no hay que fiarse del texto de alrededor: se leen
+// de ahi, que es lo que no cambia si el sitio recoloca el marcado.
+function parsePelismartEpisodes(html, pageUrl) {
+  const vistos = new Set();
+
+  return matchAll(
+    html,
+    /href="(\/(?:serie|anime)\/([a-z0-9-]+)\/temporada\/(\d+)\/capitulo\/(\d+))"/gi,
+    (match) => ({
+      path: match[1],
+      slug: match[2],
+      url: normalizeUrl(match[1], pageUrl),
+      seasonNumber: Number(match[3]),
+      episodeNumber: Number(match[4]),
+      label: `${match[3]}x${match[4]}`
+    })
+  ).filter((item) => {
+    // La pagina repite cada capitulo en varios sitios (rejilla y listado).
+    if (vistos.has(item.path)) return false;
+    vistos.add(item.path);
+    return true;
+  });
+}
+
 const PELISMART_ADAPTER = {
   id: 'pelismart',
   sourceSite: 'Pelismart',
@@ -165,7 +190,7 @@ const PELISMART_ADAPTER = {
   searchUrl: (baseUrl, title) => normalizeUrl(`search?s=${encodeURIComponent(title)}`, baseUrl),
   parseSearchResults: parsePelismartSearchResults,
   parseTitleMetadata: parsePelismartMetadata,
-  parseSeasonEpisodes: () => [],
+  parseSeasonEpisodes: parsePelismartEpisodes,
   parsePlayerOptions: parsePelismartPlayers,
   parseEpisodeNavigation: () => ({}),
   buildEpisodeTitle: (_meta, episode) => `Capitulo ${episode.episodeNumber}`
