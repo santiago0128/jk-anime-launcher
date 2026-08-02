@@ -105,7 +105,7 @@ function normalizePageUrl(url, baseUrl = PELISPLUS_BASE_URL) {
 function parseGnulaMetadata(html, pageUrl) {
   const pageTitle = matchOne(html, /<title>([^<]+)<\/title>/i);
   // El <title> viene como "Iron Man – G Nula".
-  const title = pageTitle ? cleanText(decodeHtml(pageTitle).replace(/\s*[–—-]\s*G\s*Nula\s*$/i, '')) : null;
+  const title = pageTitle ? cleanText(pageTitle.replace(/\s*[–—-]\s*G\s*Nula\s*$/i, '')) : null;
 
   return {
     pageTitle,
@@ -126,7 +126,7 @@ function parseGnulaMetadata(html, pageUrl) {
 // botones de redes sociales.
 function parseGnulaPlayers(html) {
   return matchAll(html, /<iframe[^>]+src="(https:\/\/player\.[^"]+)"/g, (match) => ({
-    embedUrl: cleanText(decodeHtml(match[1])),
+    embedUrl: cleanText(match[1]),
     language: null,
     server: 'Gnula'
   })).map((item, index) => ({ index, ...item }));
