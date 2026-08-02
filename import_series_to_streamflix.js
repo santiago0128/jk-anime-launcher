@@ -20,7 +20,7 @@ const PELISPLUS_HOME_URL = 'https://ww9.cuevana3.to/';
 // save_pelisplus_to_streamflix.js, que es quien sabe leer su HTML.
 // Gnula va la ultima: solo tiene el reproductor incrustado, sin portada ni
 // sinopsis, asi que solo debe entrar cuando los demas no tienen video.
-const CONTENT_SITES = [PELISPLUS_HOME_URL, 'https://www.pelisplushd.la/', 'https://www2.gnula.one/'];
+const CONTENT_SITES = [PELISPLUS_HOME_URL, 'https://www.pelisplushd.la/', 'https://pelismart.mov/', 'https://www2.gnula.one/'];
 const PELISPLUS_PATH_BY_TYPE = {
   series: 'serie',
   movie: 'pelicula'

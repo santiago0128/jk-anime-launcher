@@ -97,6 +97,70 @@ function normalizePageUrl(url, baseUrl = PELISPLUS_BASE_URL) {
   return absolute.replace(/\/+$/, '');
 }
 
+// Pelismart sirve pelicula, serie y anime con la misma plantilla, y su ficha
+// trae portada y sinopsis en español, que es mas de lo que da el resto de la
+// cadena. El video va por embed: los enlaces reales viajan cifrados y solo el
+// reproductor del sitio los descifra, asi que se guarda su pagina /vidurl/ y la
+// reproduce el iframe.
+function parsePelismartSearchResults(html, baseUrl) {
+  return matchAll(
+    html,
+    /<a href="(\/(?:pelicula|serie|anime)\/[^"]+)">\s*<img[^>]*alt="([^"]*)"/g,
+    (match) => ({
+      path: match[1],
+      url: normalizeUrl(match[1], baseUrl),
+      title: cleanText(match[2]),
+      contentType: /^\/pelicula\//.test(match[1]) ? 'movie' : 'series'
+    })
+  );
+}
+
+function parsePelismartMetadata(html, pageUrl) {
+  const pageTitle = matchOne(html, /<title>([^<]+)<\/title>/i);
+  // "Ver Iron Man (2008) Online - PELISMART"
+  const limpio = pageTitle
+    ? cleanText(pageTitle.replace(/^\s*Ver\s+/i, '').replace(/\s*-\s*PELISMART\s*$/i, ''))
+    : null;
+  const anio = limpio ? (limpio.match(/\((\d{4})\)/) || [])[1] : null;
+
+  return {
+    pageTitle,
+    metaDescription: matchOne(html, /<meta[^>]+property="og:description"[^>]+content="([^"]*)"/i),
+    metaKeywords: null,
+    title: limpio ? cleanText(limpio.replace(/\s*\(\d{4}\)\s*$/, '')) : slugFromPageUrl(pageUrl),
+    rawHeading: limpio,
+    originalTitle: null,
+    synopsis: matchOne(html, /<meta[^>]+property="og:description"[^>]+content="([^"]*)"/i),
+    posterUrl: matchOne(html, /<meta[^>]+property="og:image"[^>]+content="([^"]*)"/i),
+    releaseYear: anio ? Number(anio) : null,
+    rating: null,
+    genres: []
+  };
+}
+
+function parsePelismartPlayers(html) {
+  return matchAll(html, /<iframe[^>]+src="([^"]*\/vidurl\/[^"]+)"/g, (match) => ({
+    embedUrl: cleanText(match[1]),
+    language: null,
+    server: 'Pelismart'
+  })).map((item, index) => ({ index, ...item }));
+}
+
+const PELISMART_ADAPTER = {
+  id: 'pelismart',
+  sourceSite: 'Pelismart',
+  contentTypeFromUrl: (pageUrl) => (/\/(?:serie|anime)\//i.test(pageUrl) ? 'series' : 'movie'),
+  buildTitleUrl: (baseUrl, contentType, slug) =>
+    normalizeUrl(`${contentType === 'series' ? 'serie' : 'pelicula'}/${slug}`, baseUrl),
+  searchUrl: (baseUrl, title) => normalizeUrl(`search?s=${encodeURIComponent(title)}`, baseUrl),
+  parseSearchResults: parsePelismartSearchResults,
+  parseTitleMetadata: parsePelismartMetadata,
+  parseSeasonEpisodes: () => [],
+  parsePlayerOptions: parsePelismartPlayers,
+  parseEpisodeNavigation: () => ({}),
+  buildEpisodeTitle: (_meta, episode) => `Capitulo ${episode.episodeNumber}`
+};
+
 // Gnula sirve dos cosas distintas segun quien pregunte: a un navegador le da la
 // ficha completa, y a un cliente HTTP pelado le devuelve una pagina recortada
 // cuyo <h1> es "Your IP: ...", sin portada, sinopsis, año ni generos. De ahi
@@ -162,6 +226,7 @@ function resolveAdapter(url) {
   // Gnula va antes que la comprobacion de cuevana a proposito: su reproductor
   // vive en player.cuevana.ac, y por el nombre acabaria en el adaptador que no
   // es.
+  if (hostname.includes('pelismart')) return PELISMART_ADAPTER;
   if (hostname.includes('gnula')) return GNULA_ADAPTER;
   return hostname.includes('cuevana') ? CUEVANA3_ADAPTER : PELISPLUS_ADAPTER;
 }
