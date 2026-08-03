@@ -5,6 +5,8 @@
 // dbo.Series / dbo.Seasons / dbo.Episodes + snapshot). Lo especifico de cada
 // sitio (PelisPlusHD, Cuevana3) vive en su adaptador; el resto es comun.
 
+const crypto = require('crypto');
+
 const {
   getPool,
   closePool,
@@ -27,6 +29,10 @@ const HTML_ACCEPT = 'text/html,application/xhtml+xml';
 // Abrir cada embed de terceros para buscar el archivo real es caro, asi que solo
 // se hace con los primeros candidatos; el resto queda guardado como embed.
 const MAX_DEEP_RESOLVE_CANDIDATES = 6;
+const MAX_MEDIA_RESOLVE_DEPTH = 2;
+const MIN_MOVIE_DURATION_SEC = 45 * 60;
+const PREFERRED_VIDEO_HEIGHT = 720;
+const IDEAL_VIDEO_HEIGHT = 1080;
 // Hosts que publican el m3u8 en un jwplayer empaquetado, asi que se intentan
 // antes que el resto. La familia streamwish es la mayoritaria; uqload usa la
 // misma plantilla (embed-XXXX.html) y sirve igual de bien, pero solo cuando no
@@ -941,10 +947,218 @@ async function fetchPlayerMediaUrls(embedUrl, pageUrl) {
     }
 
     const urls = extractPlayerMediaUrls(html, embedUrl);
+    const embed69Urls = await extractEmbed69Links(html);
+    urls.push(...embed69Urls);
     if (urls.length) return urls;
   }
 
   return [];
+}
+
+function parseEmbed69Payload(html) {
+  const challenge = matchOne(html, /const POW_CHALLENGE = '([^']+)'/i);
+  const difficultyText = matchOne(html, /const POW_DIFFICULTY = (\d+)/i);
+  const salt = matchOne(html, /const POW_SALT = '([^']+)'/i);
+  const dataLinkMatch = html.match(/let dataLink = (\[[\s\S]*?\]);/i);
+  if (!challenge || !difficultyText || !salt || !dataLinkMatch) return null;
+
+  try {
+    return {
+      challenge,
+      difficulty: Number(difficultyText),
+      salt,
+      dataLink: JSON.parse(dataLinkMatch[1])
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function solveEmbed69Key(challenge, difficulty, salt) {
+  const prefix = '0'.repeat(difficulty);
+  let nonce = 0;
+
+  while (true) {
+    const hash = crypto.createHash('sha256').update(challenge + nonce).digest('hex');
+    if (hash.startsWith(prefix)) {
+      return crypto.createHash('sha256').update(challenge + nonce + salt).digest();
+    }
+    nonce += 1;
+  }
+}
+
+async function decryptEmbed69Link(encryptedBase64, aesKey) {
+  try {
+    const raw = Buffer.from(encryptedBase64, 'base64');
+    const iv = raw.subarray(0, 16);
+    const ciphertext = raw.subarray(16);
+    const decipher = crypto.createDecipheriv('aes-256-cbc', aesKey.subarray(0, 32), iv);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+    return decrypted.trim();
+  } catch {
+    return null;
+  }
+}
+
+async function extractEmbed69Links(html) {
+  const payload = parseEmbed69Payload(html);
+  if (!payload || !Array.isArray(payload.dataLink) || !payload.dataLink.length) {
+    return [];
+  }
+
+  const aesKey = await solveEmbed69Key(payload.challenge, payload.difficulty, payload.salt);
+  const links = [];
+  const seen = new Set();
+
+  for (const file of payload.dataLink) {
+    for (const groupName of ['sortedEmbeds', 'downloadEmbeds']) {
+      const embeds = Array.isArray(file[groupName]) ? file[groupName] : [];
+      for (const embed of embeds) {
+        if (!embed || typeof embed.link !== 'string') continue;
+        const decrypted = await decryptEmbed69Link(embed.link, aesKey);
+        if (!decrypted || seen.has(decrypted)) continue;
+        seen.add(decrypted);
+        links.push(decrypted);
+      }
+    }
+  }
+
+  return links;
+}
+
+function sumHlsDurations(playlistText) {
+  let total = 0;
+  for (const match of playlistText.matchAll(/#EXTINF:([\d.]+)/g)) {
+    total += Number(match[1]) || 0;
+  }
+  return total > 0 ? Math.round(total) : null;
+}
+
+async function inspectHlsQuality(url, referer) {
+  try {
+    const response = await requestUrl('GET', url, { Accept: '*/*', Referer: referer });
+    const body = response.body || '';
+
+    const variants = [];
+    const lines = body.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (!/^#EXT-X-STREAM-INF:/i.test(line)) continue;
+      const nextLine = (lines[index + 1] || '').trim();
+      if (!nextLine || nextLine.startsWith('#')) continue;
+      const resolution = /RESOLUTION=(\d+)x(\d+)/i.exec(line);
+      const bandwidth = /BANDWIDTH=(\d+)/i.exec(line);
+      variants.push({
+        url: normalizeUrl(nextLine, url),
+        width: resolution ? Number(resolution[1]) : null,
+        height: resolution ? Number(resolution[2]) : null,
+        bandwidth: bandwidth ? Number(bandwidth[1]) : null
+      });
+    }
+
+    if (variants.length) {
+      variants.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bandwidth || 0) - (a.bandwidth || 0));
+      const best = variants[0];
+      const nested = await inspectHlsQuality(best.url, url);
+      return {
+        width: best.width || nested?.width || null,
+        height: best.height || nested?.height || null,
+        bandwidth: best.bandwidth || nested?.bandwidth || null,
+        durationSec: nested?.durationSec || null
+      };
+    }
+
+    return {
+      width: null,
+      height: null,
+      bandwidth: null,
+      durationSec: sumHlsDurations(body)
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function enrichVerifiedVideo(verified, referer) {
+  if (!verified) return null;
+
+  const result = { ...verified, streamWidth: null, streamHeight: null, streamBandwidth: null, streamDurationSec: null };
+  if (/mpegurl/i.test(verified.contentType || '') || /\.m3u8(?:$|\?)/i.test(verified.url || '')) {
+    const quality = await inspectHlsQuality(verified.url, referer);
+    if (quality) {
+      result.streamWidth = quality.width ?? null;
+      result.streamHeight = quality.height ?? null;
+      result.streamBandwidth = quality.bandwidth ?? null;
+      result.streamDurationSec = quality.durationSec ?? null;
+    }
+  }
+
+  return result;
+}
+
+function isRejectedMovieDuration(verified, options) {
+  return options.contentType === 'movie'
+    && verified
+    && verified.streamDurationSec != null
+    && verified.streamDurationSec < MIN_MOVIE_DURATION_SEC;
+}
+
+function scoreVerifiedVideo(verified) {
+  return (
+    (verified.streamHeight || 0) * 10000 +
+    (verified.streamBandwidth || 0) +
+    (verified.streamDurationSec || 0)
+  );
+}
+
+function isGoodEnoughVideo(verified, options) {
+  if (options.contentType !== 'movie') {
+    return (verified.streamHeight || 0) >= PREFERRED_VIDEO_HEIGHT;
+  }
+
+  return (verified.streamHeight || 0) >= PREFERRED_VIDEO_HEIGHT
+    && (verified.streamDurationSec == null || verified.streamDurationSec >= MIN_MOVIE_DURATION_SEC);
+}
+
+function isPreferredQualityVideo(verified, options) {
+  if (options.contentType !== 'movie') {
+    return (verified.streamHeight || 0) >= IDEAL_VIDEO_HEIGHT;
+  }
+
+  return (verified.streamHeight || 0) >= IDEAL_VIDEO_HEIGHT
+    && (verified.streamDurationSec == null || verified.streamDurationSec >= MIN_MOVIE_DURATION_SEC);
+}
+
+async function resolveMediaCandidate(candidateUrl, referer, options, depth = 0) {
+  if (!candidateUrl) return null;
+
+  if (looksLikeVideoFile(candidateUrl)) {
+    const verified = await probeVideoUrl(candidateUrl, { Referer: referer });
+    if (!verified) return null;
+    return enrichVerifiedVideo(verified, referer);
+  }
+
+  if (depth >= MAX_MEDIA_RESOLVE_DEPTH) {
+    return null;
+  }
+
+  const nestedMediaUrls = await fetchPlayerMediaUrls(candidateUrl, referer);
+  let bestNested = null;
+
+  for (const nestedMediaUrl of nestedMediaUrls) {
+    const resolved = await resolveMediaCandidate(nestedMediaUrl, candidateUrl, options, depth + 1);
+    if (!resolved) continue;
+
+    if (!bestNested || scoreVerifiedVideo(resolved) > scoreVerifiedVideo(bestNested)) {
+      bestNested = resolved;
+    }
+
+    if (isPreferredQualityVideo(resolved, options)) {
+      return resolved;
+    }
+  }
+
+  return bestNested;
 }
 
 // El player hace sources:[{file: links.hls4||links.hls3||links.hls2}], asi que se
@@ -986,6 +1200,7 @@ function extractPlayerMediaUrls(html, pageUrl) {
 // en todos los capitulos: si uno falla se anota para no reintentarlo en esta
 // corrida (42 capitulos x 20 s por servidor muerto es media hora perdida).
 const unreachableHosts = new Set();
+const deadEmbedUrls = new Map();
 
 function hostOf(url) {
   try {
@@ -997,9 +1212,10 @@ function hostOf(url) {
 
 // Mismo criterio que el importador de anime: se prefiere un archivo de video
 // verificado; si ningun embed lo expone, el episodio se guarda como iframe.
-async function resolveVerifiedVideo(playerOptions, pageUrl) {
+async function resolveVerifiedVideo(playerOptions, pageUrl, options = {}) {
   const attempted = [];
   const seen = new Set();
+  let bestResult = null;
 
   for (const option of playerOptions) {
     const normalized = normalizeUrl(option.embedUrl, pageUrl);
@@ -1013,25 +1229,40 @@ async function resolveVerifiedVideo(playerOptions, pageUrl) {
   let deepResolveBudget = MAX_DEEP_RESOLVE_CANDIDATES;
 
   for (const candidate of attempted) {
+    if (deadEmbedUrls.has(candidate.url)) {
+      continue;
+    }
+
     if (unreachableHosts.has(hostOf(candidate.url))) {
       continue;
     }
 
-    if (looksLikeVideoFile(candidate.url)) {
-      const verified = await probeVideoUrl(candidate.url, { Referer: pageUrl });
-      if (verified) {
-        return {
-          videoSrcUrl: candidate.url,
-          videoSrcSource: candidate.source,
-          videoSrcReferer: pageUrl,
-          verifiedVideoUrl: verified.url,
-          verifiedVideoSource: candidate.source,
-          verifiedVideoKind: candidate.kind,
-          verifiedVideoContentType: verified.contentType,
-          verifiedVideoStatusCode: verified.statusCode,
-          verifiedVideoReferer: null,
-          verificationAttempts: attempted
-        };
+    const directVerified = await resolveMediaCandidate(candidate.url, pageUrl, options, 0);
+    if (directVerified) {
+      const current = {
+        videoSrcUrl: candidate.url,
+        videoSrcSource: candidate.source,
+        videoSrcReferer: pageUrl,
+        verifiedVideoUrl: directVerified.url,
+        verifiedVideoSource: candidate.source,
+        verifiedVideoKind: candidate.kind,
+        verifiedVideoContentType: directVerified.contentType,
+        verifiedVideoStatusCode: directVerified.statusCode,
+        verifiedVideoReferer: null,
+        verificationAttempts: attempted,
+        streamWidth: directVerified.streamWidth,
+        streamHeight: directVerified.streamHeight,
+        streamBandwidth: directVerified.streamBandwidth,
+        streamDurationSec: directVerified.streamDurationSec
+      };
+
+      if (!isRejectedMovieDuration(current, options)) {
+        if (!bestResult || scoreVerifiedVideo(current) > scoreVerifiedVideo(bestResult)) {
+          bestResult = current;
+        }
+        if (isPreferredQualityVideo(current, options)) {
+          return current;
+        }
       }
     }
 
@@ -1045,20 +1276,35 @@ async function resolveVerifiedVideo(playerOptions, pageUrl) {
       const extractedMediaUrls = await fetchPlayerMediaUrls(candidate.url, pageUrl);
 
       for (const extractedMediaUrl of extractedMediaUrls) {
-        const verified = await probeVideoUrl(extractedMediaUrl, { Referer: candidate.url });
-        if (verified) {
-          return {
-            videoSrcUrl: extractedMediaUrl,
-            videoSrcSource: candidate.source,
-            videoSrcReferer: candidate.url,
-            verifiedVideoUrl: verified.url,
-            verifiedVideoSource: candidate.source,
-            verifiedVideoKind: `${candidate.kind}-extracted`,
-            verifiedVideoContentType: verified.contentType,
-            verifiedVideoStatusCode: verified.statusCode,
-            verifiedVideoReferer: candidate.url,
-            verificationAttempts: attempted
-          };
+        const verified = await resolveMediaCandidate(extractedMediaUrl, candidate.url, options, 1);
+        if (!verified) continue;
+
+        const current = {
+          videoSrcUrl: extractedMediaUrl,
+          videoSrcSource: candidate.source,
+          videoSrcReferer: candidate.url,
+          verifiedVideoUrl: verified.url,
+          verifiedVideoSource: candidate.source,
+          verifiedVideoKind: `${candidate.kind}-extracted`,
+          verifiedVideoContentType: verified.contentType,
+          verifiedVideoStatusCode: verified.statusCode,
+          verifiedVideoReferer: candidate.url,
+          verificationAttempts: attempted,
+          streamWidth: verified.streamWidth,
+          streamHeight: verified.streamHeight,
+          streamBandwidth: verified.streamBandwidth,
+          streamDurationSec: verified.streamDurationSec
+        };
+
+        if (isRejectedMovieDuration(current, options)) {
+          continue;
+        }
+
+        if (!bestResult || scoreVerifiedVideo(current) > scoreVerifiedVideo(bestResult)) {
+          bestResult = current;
+        }
+        if (isPreferredQualityVideo(current, options)) {
+          return current;
         }
       }
     } catch (error) {
@@ -1071,6 +1317,10 @@ async function resolveVerifiedVideo(playerOptions, pageUrl) {
     }
   }
 
+  if (bestResult) {
+    return bestResult;
+  }
+
   return {
     videoSrcUrl: NO_VIDEO_FOUND,
     videoSrcSource: 'NO_VIDEO_FOUND',
@@ -1081,20 +1331,97 @@ async function resolveVerifiedVideo(playerOptions, pageUrl) {
     verifiedVideoContentType: null,
     verifiedVideoStatusCode: null,
     verifiedVideoReferer: null,
-    verificationAttempts: attempted
+    verificationAttempts: attempted,
+    streamWidth: null,
+    streamHeight: null,
+    streamBandwidth: null,
+    streamDurationSec: null
   };
 }
 
 // Un embed solo sirve si su servidor sigue en pie. Guardar el primero sin
 // comprobarlo es lo que metia en el catalogo capitulos que no reproducen nada,
 // asi que se prueba uno por uno y si ninguno responde el capitulo no se guarda.
+// Estos hosts no usan 404 para decir que un archivo ya no esta: sirven una
+// pagina de aviso con codigo 200. Comprobar solo el codigo metia en el catalogo
+// capitulos que al abrirlos muestran "We can't find the file you are looking
+// for. It maybe got deleted by the owner or was removed due a copyright
+// violation", que es exactamente lo que se veia en el reproductor.
+const AVISOS_ARCHIVO_MUERTO = [
+  /no longer available/i,
+  /has been deleted/i,
+  /deleted by the owner/i,
+  /copyright violation/i,
+  /can'?t find the file/i,
+  /we[''´’]re sorry/i,
+  /file (?:not found|was deleted|is expired)/i,
+  /video (?:not found|has been removed|unavailable)/i,
+  /alliance4creativity|watch-it-legally/i
+];
+
+function avisoDeArchivoMuerto(cuerpo) {
+  for (const patron of AVISOS_ARCHIVO_MUERTO) {
+    const encontrado = patron.exec(cuerpo || '');
+    if (encontrado) return encontrado[0].slice(0, 60);
+  }
+  // Aqui hubo una regla de "pagina de menos de 600 bytes = muerta". Se quita a
+  // proposito: streamwish sirve un cargador de 452-811 bytes que en el navegador
+  // monta el reproductor entero (135 KB, con <video> y jwplayer, comprobado).
+  // Descartarlo por tamaño tiraba un embed que SI funciona. Las paginas de
+  // archivo borrado siempre lo dicen con todas las letras, y para eso estan los
+  // patrones de arriba.
+  return null;
+}
+
+// Varios hosts (waaw.to y los de su familia) sirven una pagina exterior con
+// anuncios y meten el reproductor en un iframe. La de fuera parece sana aunque
+// el archivo ya no exista: el aviso esta dentro. Sin seguir ese iframe, el
+// capitulo se guardaba como bueno.
+function frameInterno(html, embedUrl) {
+  const encontrado = /<iframe[^>]+src="([^"]+)"/i.exec(html || '');
+  if (!encontrado) return null;
+  try {
+    const destino = new URL(encontrado[1], embedUrl);
+    if (destino.hostname !== new URL(embedUrl).hostname) return null;  // publicidad de terceros
+    return destino.toString();
+  } catch {
+    return null;
+  }
+}
+
 async function embedResponds(embedUrl, pageUrl) {
   const host = hostOf(embedUrl);
+  if (deadEmbedUrls.has(embedUrl)) return false;
   if (unreachableHosts.has(host)) return false;
 
   try {
     const response = await requestUrl('GET', embedUrl, { Accept: HTML_ACCEPT, Referer: pageUrl });
-    return response.statusCode < 400;
+    if (response.statusCode >= 400) {
+      deadEmbedUrls.set(embedUrl, `HTTP ${response.statusCode}`);
+      return false;
+    }
+
+    const muerto = avisoDeArchivoMuerto(response.body);
+    if (muerto) {
+      deadEmbedUrls.set(embedUrl, muerto);
+      process.stderr.write(`    ${host}: descartado (${muerto})\n`);
+      return false;
+    }
+
+    const dentro = frameInterno(response.body, embedUrl);
+    if (dentro) {
+      const interno = await requestUrl('GET', dentro, { Accept: HTML_ACCEPT, Referer: embedUrl });
+      const muertoDentro = interno.statusCode >= 400
+        ? `el reproductor responde ${interno.statusCode}`
+        : avisoDeArchivoMuerto(interno.body);
+      if (muertoDentro) {
+        deadEmbedUrls.set(embedUrl, muertoDentro);
+        process.stderr.write(`    ${host}: descartado (${muertoDentro})\n`);
+        return false;
+      }
+    }
+
+    return true;
   } catch (error) {
     if (/tiempo de espera|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|socket hang up/i.test(error.message || '')) {
       unreachableHosts.add(host);
@@ -1103,7 +1430,95 @@ async function embedResponds(embedUrl, pageUrl) {
   }
 }
 
-async function pickPlayback(playerOptions, verification, pageUrl) {
+// Sitios donde buscar el mismo capitulo cuando el principal no tiene ninguno
+// vivo. Es la lista del importador; se repite aqui para que este modulo pueda
+// buscar por su cuenta sin depender de quien lo llame.
+const SITIOS_ALTERNATIVOS = [
+  'https://ww9.cuevana3.to/',
+  'https://www.pelisplushd.la/',
+  'https://pelismart.mov/',
+  'https://www2.gnula.one/'
+];
+
+// Prepara los otros sitios una sola vez: buscar el titulo en cada uno y quedarse
+// con un indice "TxE" -> url. Hacerlo por capitulo seria una busqueda por
+// capitulo, que multiplica el tiempo de importacion por el numero de sitios.
+async function prepararAlternativas(contentType, titulo, urlPrincipal) {
+  const hostPrincipal = (() => { try { return new URL(urlPrincipal).hostname; } catch { return ''; } })();
+  const alternativas = [];
+
+  for (const baseUrl of SITIOS_ALTERNATIVOS) {
+    if (new URL(baseUrl).hostname === hostPrincipal) continue;
+
+    try {
+      const encontrado = await searchTitle({ baseUrl, contentType, title: titulo });
+      if (!encontrado || !encontrado.match || !encontrado.match.strong) continue;
+
+      const adaptador = resolveAdapter(encontrado.match.url);
+      const html = await fetchPageHtml(encontrado.match.url);
+      const capitulos = adaptador.parseSeasonEpisodes(html, encontrado.match.url);
+      if (!capitulos.length) continue;
+
+      const indice = new Map();
+      for (const c of capitulos) indice.set(`${c.seasonNumber}x${c.episodeNumber}`, c.url);
+      alternativas.push({ adaptador, indice, sitio: adaptador.sourceSite });
+      process.stderr.write(`  respaldo listo en ${adaptador.sourceSite} (${capitulos.length} capitulos)\n`);
+    } catch {
+      // Un sitio que no responde no puede tumbar la importacion.
+    }
+  }
+
+  return alternativas;
+}
+
+// Busca ESTE capitulo en los sitios de respaldo. Cuando se pide priorizar el
+// reproductor propio, sigue bajando por la lista hasta encontrar un archivo/HLS
+// real y solo devuelve un embed si no hubo nada mejor.
+async function buscarEnAlternativas(alternativas, episode, options = {}) {
+  const clave = `${episode.seasonNumber}x${episode.episodeNumber}`;
+  const preferNative = options.preferNative === true;
+  let mejorEmbed = null;
+
+  for (const alternativa of alternativas) {
+    const url = alternativa.indice.get(clave);
+    if (!url) continue;
+
+    try {
+      const html = await fetchPageHtml(url);
+      const playerOptions = alternativa.adaptador.parsePlayerOptions(html);
+      if (!playerOptions.length) continue;
+
+      const verification = await resolveVerifiedVideo(playerOptions, url);
+      const playback = await pickPlayback(playerOptions, verification, url);
+      if (playback) {
+        const found = { playback, verification, playerOptions, html, url, sitio: alternativa.sitio };
+        if (playback.provider !== 'embed') {
+          process.stderr.write(`    recuperado desde ${alternativa.sitio}\n`);
+          return found;
+        }
+
+        if (!mejorEmbed) {
+          mejorEmbed = found;
+        }
+
+        if (!preferNative) {
+          process.stderr.write(`    recuperado desde ${alternativa.sitio}\n`);
+          return found;
+        }
+      }
+    } catch {
+      // Siguiente sitio.
+    }
+  }
+
+  if (mejorEmbed) {
+    process.stderr.write(`    solo quedo embed externo en ${mejorEmbed.sitio}\n`);
+  }
+
+  return mejorEmbed;
+}
+
+async function pickPlayback(playerOptions, verification, pageUrl, options = {}) {
   const hasVerified = verification.verifiedVideoUrl && verification.verifiedVideoUrl !== NO_VIDEO_FOUND;
 
   if (hasVerified) {
@@ -1112,6 +1527,10 @@ async function pickPlayback(playerOptions, verification, pageUrl) {
       provider: /mpegurl/i.test(verification.verifiedVideoContentType || '') ? 'hls' : 'file',
       source: verification.verifiedVideoSource
     };
+  }
+
+  if (options.allowEmbed === false) {
+    return null;
   }
 
   for (const option of playerOptions) {
@@ -1126,6 +1545,44 @@ async function pickPlayback(playerOptions, verification, pageUrl) {
   }
 
   return null;
+}
+
+async function buscarPeliculaEnAlternativas(contentType, titulo, urlPrincipal, options = {}) {
+  const hostPrincipal = (() => { try { return new URL(urlPrincipal).hostname; } catch { return ''; } })();
+  const preferNative = options.preferNative === true;
+  let mejorEmbed = null;
+
+  for (const baseUrl of SITIOS_ALTERNATIVOS) {
+    if (new URL(baseUrl).hostname === hostPrincipal) continue;
+
+    try {
+      const encontrado = await searchTitle({ baseUrl, contentType, title: titulo });
+      if (!encontrado || !isStrongMatch(encontrado)) continue;
+
+      const adaptador = resolveAdapter(encontrado.url);
+      const html = await fetchPageHtml(encontrado.url);
+      const playerOptions = adaptador.parsePlayerOptions(html);
+      if (!playerOptions.length) continue;
+
+      const verification = await resolveVerifiedVideo(playerOptions, encontrado.url, { contentType: 'movie' });
+      const playback = await pickPlayback(playerOptions, verification, encontrado.url, { allowEmbed: !preferNative });
+      if (!playback) continue;
+
+      const found = { playback, verification, playerOptions, html, url: encontrado.url, sitio: adaptador.sourceSite, adaptador };
+      if (playback.provider !== 'embed') {
+        process.stderr.write(`    pelicula recuperada desde ${adaptador.sourceSite}\n`);
+        return found;
+      }
+
+      if (!mejorEmbed) {
+        mejorEmbed = found;
+      }
+    } catch {
+      // Siguiente sitio.
+    }
+  }
+
+  return mejorEmbed;
 }
 
 async function ensureSnapshotTable(pool) {
@@ -1156,6 +1613,10 @@ async function ensureSnapshotTable(pool) {
       VerifiedVideoContentType NVARCHAR(255) NULL,
       VerifiedVideoStatusCode INT NULL,
       VerifiedVideoReferer NVARCHAR(1000) NULL,
+      VerifiedVideoWidth INT NULL,
+      VerifiedVideoHeight INT NULL,
+      VerifiedVideoBandwidth BIGINT NULL,
+      VerifiedVideoDurationSec INT NULL,
       SavedProvider NVARCHAR(20) NULL,
       PageTitle NVARCHAR(500) NULL,
       MetaDescription NVARCHAR(MAX) NULL,
@@ -1172,6 +1633,17 @@ async function ensureSnapshotTable(pool) {
       UpdatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
       CONSTRAINT UQ_PelisPlusSnapshots_EpisodePageUrl UNIQUE (EpisodePageUrl)
     );
+  `);
+
+  await pool.request().query(`
+    IF COL_LENGTH('dbo.PelisPlusSnapshots', 'VerifiedVideoWidth') IS NULL
+      ALTER TABLE dbo.PelisPlusSnapshots ADD VerifiedVideoWidth INT NULL;
+    IF COL_LENGTH('dbo.PelisPlusSnapshots', 'VerifiedVideoHeight') IS NULL
+      ALTER TABLE dbo.PelisPlusSnapshots ADD VerifiedVideoHeight INT NULL;
+    IF COL_LENGTH('dbo.PelisPlusSnapshots', 'VerifiedVideoBandwidth') IS NULL
+      ALTER TABLE dbo.PelisPlusSnapshots ADD VerifiedVideoBandwidth BIGINT NULL;
+    IF COL_LENGTH('dbo.PelisPlusSnapshots', 'VerifiedVideoDurationSec') IS NULL
+      ALTER TABLE dbo.PelisPlusSnapshots ADD VerifiedVideoDurationSec INT NULL;
   `);
 }
 
@@ -1445,6 +1917,10 @@ async function upsertSnapshot(pool, snapshot) {
       .input('verifiedVideoContentType', snapshot.verifiedVideoContentType)
       .input('verifiedVideoStatusCode', snapshot.verifiedVideoStatusCode)
       .input('verifiedVideoReferer', snapshot.verifiedVideoReferer)
+      .input('verifiedVideoWidth', snapshot.streamWidth)
+      .input('verifiedVideoHeight', snapshot.streamHeight)
+      .input('verifiedVideoBandwidth', snapshot.streamBandwidth)
+      .input('verifiedVideoDurationSec', snapshot.streamDurationSec)
       .input('savedProvider', snapshot.savedProvider)
       .input('pageTitle', snapshot.pageTitle)
       .input('metaDescription', snapshot.metaDescription)
@@ -1485,6 +1961,10 @@ async function upsertSnapshot(pool, snapshot) {
         VerifiedVideoContentType = @verifiedVideoContentType,
         VerifiedVideoStatusCode = @verifiedVideoStatusCode,
         VerifiedVideoReferer = @verifiedVideoReferer,
+        VerifiedVideoWidth = @verifiedVideoWidth,
+        VerifiedVideoHeight = @verifiedVideoHeight,
+        VerifiedVideoBandwidth = @verifiedVideoBandwidth,
+        VerifiedVideoDurationSec = @verifiedVideoDurationSec,
         SavedProvider = @savedProvider,
         PageTitle = @pageTitle,
         MetaDescription = @metaDescription,
@@ -1529,6 +2009,10 @@ async function upsertSnapshot(pool, snapshot) {
       VerifiedVideoContentType,
       VerifiedVideoStatusCode,
       VerifiedVideoReferer,
+      VerifiedVideoWidth,
+      VerifiedVideoHeight,
+      VerifiedVideoBandwidth,
+      VerifiedVideoDurationSec,
       SavedProvider,
       PageTitle,
       MetaDescription,
@@ -1567,6 +2051,10 @@ async function upsertSnapshot(pool, snapshot) {
       @verifiedVideoContentType,
       @verifiedVideoStatusCode,
       @verifiedVideoReferer,
+      @verifiedVideoWidth,
+      @verifiedVideoHeight,
+      @verifiedVideoBandwidth,
+      @verifiedVideoDurationSec,
       @savedProvider,
       @pageTitle,
       @metaDescription,
@@ -1599,13 +2087,21 @@ function selectEpisodes(episodes, options) {
 }
 
 async function importMovie(pool, context, options) {
-  const { titleData, html, pageUrl, adapter } = context;
-  const playerOptions = adapter.parsePlayerOptions(html);
-  const verification = await resolveVerifiedVideo(playerOptions, pageUrl);
-  const playback = await pickPlayback(playerOptions, verification, pageUrl);
+  const { titleData } = context;
+  let { html, pageUrl, adapter } = context;
+  let playerOptions = adapter.parsePlayerOptions(html);
+  let verification = await resolveVerifiedVideo(playerOptions, pageUrl, { contentType: 'movie' });
+  let playback = await pickPlayback(playerOptions, verification, pageUrl, { allowEmbed: false });
 
   if (!playback) {
-    throw new Error(`La pelicula "${titleData.title}" no expone ningun reproductor en ${adapter.sourceSite}.`);
+    const rescate = await buscarPeliculaEnAlternativas('movie', titleData.title, pageUrl, { preferNative: true });
+    if (rescate) {
+      ({ playback, verification, playerOptions, html, url: pageUrl, adaptador: adapter } = rescate);
+    }
+  }
+
+  if (!playback || playback.provider === 'embed') {
+    throw new Error(`La pelicula "${titleData.title}" no expone un video nativo reproducible para el player propio.`);
   }
 
   const seriesId = await ensureSeries(pool, titleData, adapter);
@@ -1623,7 +2119,7 @@ async function importMovie(pool, context, options) {
     videoUrl: playback.videoUrl,
     provider: playback.provider,
     thumbnailUrl: titleData.posterUrl,
-    durationSec: null
+    durationSec: verification?.streamDurationSec ?? null
   });
 
   const snapshotId = await upsertSnapshot(pool, {
@@ -1709,25 +2205,52 @@ async function importSeries(pool, context, options) {
   const imported = [];
   const skipped = [];
 
+  // Los sitios de respaldo se preparan una vez, y solo si de verdad hacen falta:
+  // se dejan sin resolver hasta que falle el primer capitulo.
+  let alternativas = null;
+  const alternativasListas = async () => {
+    if (alternativas === null) {
+      alternativas = await prepararAlternativas(titleData.contentType, titleData.title, pageUrl);
+    }
+    return alternativas;
+  };
+
   for (const episode of episodes) {
-    let episodeHtml;
+    let episodeHtml = null;
+    let playerOptions = [];
+    let verification = null;
+    let playback = null;
+    let urlDelCapitulo = episode.url;
+    let adaptadorUsado = adapter;
+
     try {
       episodeHtml = await fetchPageHtml(episode.url);
+      playerOptions = adapter.parsePlayerOptions(episodeHtml);
+      if (playerOptions.length) {
+        verification = await resolveVerifiedVideo(playerOptions, episode.url, { contentType: 'series' });
+        playback = await pickPlayback(playerOptions, verification, episode.url);
+      }
     } catch (error) {
-      skipped.push({ ...episode, reason: `No pude cargar la pagina: ${error.message || String(error)}` });
-      continue;
+      process.stderr.write(`    ${adapter.sourceSite}: ${error.message || error}\n`);
     }
 
-    const playerOptions = adapter.parsePlayerOptions(episodeHtml);
-    if (!playerOptions.length) {
-      skipped.push({ ...episode, reason: 'El capitulo no tiene reproductores publicados.' });
-      continue;
+    const necesitaRescate = !playback || playback.provider === 'embed';
+    if (necesitaRescate) {
+      const rescate = await buscarEnAlternativas(await alternativasListas(), episode, { preferNative: true });
+      if (rescate && (!playback || rescate.playback.provider !== 'embed')) {
+        ({ playback, verification, playerOptions, html: episodeHtml } = rescate);
+        urlDelCapitulo = rescate.url;
+        adaptadorUsado = resolveAdapter(rescate.url);
+      }
     }
 
-    const verification = await resolveVerifiedVideo(playerOptions, episode.url);
-    const playback = await pickPlayback(playerOptions, verification, episode.url);
-    if (!playback) {
-      skipped.push({ ...episode, reason: 'No pude resolver ninguna URL de video.' });
+    if (!playback || playback.provider === 'embed') {
+      skipped.push({
+        ...episode,
+        reason: playerOptions.length
+          ? 'No encontre un HLS/archivo reproducible para el player propio, tampoco en los otros sitios.'
+          : 'El capitulo no tiene reproductores publicados en ningun sitio.'
+      });
       continue;
     }
 
@@ -1738,9 +2261,9 @@ async function importSeries(pool, context, options) {
       );
     }
 
-    const episodeMeta = adapter.parseTitleMetadata(episodeHtml, episode.url);
-    const navigation = adapter.parseEpisodeNavigation(episodeHtml, episode.url);
-    const episodeTitle = adapter.buildEpisodeTitle(episodeMeta, episode);
+    const episodeMeta = adaptadorUsado.parseTitleMetadata(episodeHtml, urlDelCapitulo);
+    const navigation = adaptadorUsado.parseEpisodeNavigation(episodeHtml, urlDelCapitulo);
+    const episodeTitle = adaptadorUsado.buildEpisodeTitle(episodeMeta, episode);
 
     const episodeId = await ensureEpisode(pool, seasonIds.get(episode.seasonNumber), {
       episodeNumber: episode.episodeNumber,
@@ -1749,11 +2272,11 @@ async function importSeries(pool, context, options) {
       videoUrl: playback.videoUrl,
       provider: playback.provider,
       thumbnailUrl: episodeMeta.posterUrl || titleData.posterUrl,
-      durationSec: null
+      durationSec: verification?.streamDurationSec ?? null
     });
 
     const snapshotId = await upsertSnapshot(pool, {
-      sourceSite: adapter.sourceSite,
+      sourceSite: adaptadorUsado.sourceSite,
       sourceType: 'episode-page',
       contentType: titleData.contentType,
       seriesName: titleData.title,
@@ -1764,7 +2287,7 @@ async function importSeries(pool, context, options) {
       seasonNumber: episode.seasonNumber,
       episodeNumber: episode.episodeNumber,
       episodeTitle,
-      episodePageUrl: episode.url,
+      episodePageUrl: urlDelCapitulo,
       primaryVideoUrl: playerOptions[0]?.embedUrl || null,
       primaryVideoSource: playerOptions[0]?.server || null,
       savedProvider: playback.provider,
@@ -1812,7 +2335,16 @@ async function importSeries(pool, context, options) {
     );
   }
 
-  return { seriesId, imported, skipped, episodesDetected: allEpisodes.length };
+  const seasonCoverage = [...new Set(allEpisodes.map((episode) => episode.seasonNumber))]
+    .sort((a, b) => a - b)
+    .map((seasonNumber) => ({
+      seasonNumber,
+      detected: allEpisodes.filter((episode) => episode.seasonNumber === seasonNumber).length,
+      imported: imported.filter((episode) => episode.seasonNumber === seasonNumber).length,
+      skipped: skipped.filter((episode) => episode.seasonNumber === seasonNumber).length
+    }));
+
+  return { seriesId, imported, skipped, episodesDetected: allEpisodes.length, seasonCoverage };
 }
 
 async function main(options = {}) {
@@ -1861,6 +2393,7 @@ async function main(options = {}) {
       rating: titleData.rating,
       genres: titleData.genres,
       episodesDetected: outcome.episodesDetected ?? outcome.imported.length,
+      seasonCoverage: outcome.seasonCoverage || [],
       importedCount: outcome.imported.length,
       skippedCount: outcome.skipped.length,
       imported: outcome.imported,
