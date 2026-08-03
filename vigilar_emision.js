@@ -166,6 +166,37 @@ async function buscarSerie(pool, titulo) {
   return resultado.recordset;
 }
 
+// Busca si el arco ya tiene temporada en el catalogo, comparando el titulo de
+// AniList con el de los capitulos guardados. Sin esto hay que pasar el numero a
+// mano, y equivocarse crea una temporada duplicada con los mismos capitulos:
+// paso exactamente eso registrando Kashin-tan, que ya estaba y acabo por
+// duplicado en otra temporada.
+async function temporadaDelArco(pool, seriesId, tituloAniList) {
+  if (!tituloAniList) return null;
+
+  // "BLEACH: Sennen Kessen-hen - Kashin-tan" -> "Kashin-tan". La parte
+  // distintiva es la ultima, que es la que aparece en el titulo del capitulo.
+  // Se parte SOLO por separadores de verdad (" - ", ": "): cortando por
+  // cualquier guion, "Sennen Kessen-hen" se rompia por la mitad y quedaba "tan".
+  const partes = String(tituloAniList).split(/\s+[-–—]\s+|:\s+/).map((p) => p.trim()).filter(Boolean);
+  const distintivo = partes[partes.length - 1];
+  if (!distintivo || distintivo.length < 4) return null;
+
+  const resultado = await pool
+    .request()
+    .input('id', seriesId)
+    .input('marca', `%${distintivo}%`)
+    .query(`
+      SELECT TOP 1 se.SeasonNumber, COUNT(*) AS Coinciden
+      FROM dbo.Episodes e JOIN dbo.Seasons se ON se.Id = e.SeasonId
+      WHERE se.SeriesId = @id AND e.Title LIKE @marca
+      GROUP BY se.SeasonNumber
+      ORDER BY COUNT(*) DESC
+    `);
+
+  return resultado.recordset.length ? resultado.recordset[0].SeasonNumber : null;
+}
+
 // Con temporada, se cuenta dentro de ella: los capitulos de un arco nuevo
 // empiezan por el 1 y compararlos con el maximo de toda la serie no dice nada.
 async function ultimoEpisodioEn(pool, seriesId, seasonNumber) {
@@ -272,7 +303,11 @@ async function registrar(pool, titulo, preferido, opciones = {}) {
   const slug = opciones.slug || (String(serie.SourceRef || '').startsWith('jkanime:')
     ? String(serie.SourceRef).slice('jkanime:'.length)
     : null);
-  const temporada = opciones.temporada != null ? Number(opciones.temporada) : null;
+  // Si no se dice, se busca: casi siempre el arco ya tiene su temporada y
+  // acertarla sola evita crear una duplicada con los mismos capitulos.
+  const temporada = opciones.temporada != null
+    ? Number(opciones.temporada)
+    : await temporadaDelArco(pool, serie.Id, tituloDe(media));
 
   const ultimo = await ultimoEpisodioEn(pool, serie.Id, temporada);
   await guardarCalendario(pool, serie.Id, media, ultimo, { slug, temporada });
