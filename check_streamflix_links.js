@@ -107,10 +107,9 @@ function motivoEmbedMuerto(response) {
     }
   }
 
-  // Un reproductor real trae su JS y su maquetado; nada util cabe en tan poco.
-  if (cuerpo.length > 0 && cuerpo.length < 600) {
-    return `el host devuelve una pagina de ${cuerpo.length} bytes, sin reproductor`;
-  }
+  // Sin regla por tamaño: streamwish sirve un cargador de pocos cientos de
+  // bytes que en el navegador monta el reproductor entero. Marcarlo por
+  // pequeño daba por muerto un embed que si funciona.
 
   return null;
 }

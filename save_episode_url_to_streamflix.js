@@ -56,7 +56,34 @@ const TRANSIENT_HTTP_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504, 520, 
 // Algunos servidores de video aceptan la conexion y no responden nunca. Sin este
 // tope una sola peticion deja colgada la importacion entera.
 const REQUEST_TIMEOUT_MS = 20000;
+const INSECURE_TLS_HOST_HINTS = ['pelisplushd.la'];
 let runtimeConfig = null;
+
+function needsInsecureTls(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return INSECURE_TLS_HOST_HINTS.some((hint) => hostname === hint || hostname.endsWith(`.${hint}`));
+  } catch {
+    return false;
+  }
+}
+
+function buildRequestOptions(url, method, headers = {}) {
+  const options = {
+    method,
+    timeout: REQUEST_TIMEOUT_MS,
+    headers: {
+      'User-Agent': USER_AGENT,
+      ...headers
+    }
+  };
+
+  if (url.startsWith('https:') && needsInsecureTls(url)) {
+    options.agent = new https.Agent({ rejectUnauthorized: false });
+  }
+
+  return options;
+}
 
 function buildRuntimeConfig(overrides = {}) {
   const episodeUrl = overrides.episodeUrl || process.env.JK_EPISODE_URL || 'https://jkanime.net/dragon-ball-z/1/';
@@ -233,10 +260,13 @@ function parseEpisodeData(html) {
       generatedDownloadUrl
     };
   });
+  const localPlayerDesu = playerEmbeds.find((item) => item.index === 0) || null;
+  const localPlayerMagi = playerEmbeds.find((item) => item.index === 1) || null;
+  const localPlayerDesuka = playerEmbeds.find((item) => item.index === 2) || null;
   const localPlayerOptions = [
-    { label: 'Desu', embedUrl: playerEmbeds.find((item) => item.index === 0)?.embedUrl || null, type: 'jkplayer-um' },
-    { label: 'Magi', embedUrl: playerEmbeds.find((item) => item.index === 1)?.embedUrl || null, type: 'jkplayer-umv' },
-    { label: 'Desuka', embedUrl: playerEmbeds.find((item) => item.index === 2)?.embedUrl || null, type: 'jkplayer-jk' }
+    { label: 'Desu', embedUrl: localPlayerDesu ? localPlayerDesu.embedUrl : null, type: 'jkplayer-um' },
+    { label: 'Magi', embedUrl: localPlayerMagi ? localPlayerMagi.embedUrl : null, type: 'jkplayer-umv' },
+    { label: 'Desuka', embedUrl: localPlayerDesuka ? localPlayerDesuka.embedUrl : null, type: 'jkplayer-jk' }
   ].filter((item) => item.embedUrl);
   const downloadOptions = serverOptions.map((item) => ({
     server: item.server,
@@ -260,16 +290,16 @@ function parseEpisodeData(html) {
     serverOptions[0] ||
     null;
   const primaryVideoUrl =
-    preferredLocalPlayer?.embedUrl ||
-    preferredServerPlayer?.generatedEmbedUrl ||
-    preferredServerPlayer?.decodedRemoteUrl ||
+    (preferredLocalPlayer && preferredLocalPlayer.embedUrl) ||
+    (preferredServerPlayer && preferredServerPlayer.generatedEmbedUrl) ||
+    (preferredServerPlayer && preferredServerPlayer.decodedRemoteUrl) ||
     null;
   const primaryVideoSource =
-    preferredLocalPlayer?.label ||
-    preferredServerPlayer?.server ||
+    (preferredLocalPlayer && preferredLocalPlayer.label) ||
+    (preferredServerPlayer && preferredServerPlayer.server) ||
     null;
-  const directMediaUrl = directMediaOption?.decodedRemoteUrl || null;
-  const directMediaSource = directMediaOption?.server || null;
+  const directMediaUrl = (directMediaOption && directMediaOption.decodedRemoteUrl) || null;
+  const directMediaSource = (directMediaOption && directMediaOption.server) || null;
   const directMediaFormat = directMediaUrl
     ? ((directMediaUrl.match(/\.(mp4|webm)(?:$|\?)/i) || [])[1] || null)
     : null;
@@ -321,13 +351,7 @@ async function fetchEpisodeHtml(attempt = 1) {
     return await new Promise((resolve, reject) => {
       const request = https.get(
         episodeUrl,
-        {
-          timeout: REQUEST_TIMEOUT_MS,
-          headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'text/html,application/xhtml+xml'
-          }
-        },
+        buildRequestOptions(episodeUrl, 'GET', { Accept: 'text/html,application/xhtml+xml' }),
         (response) => {
           if (response.statusCode && response.statusCode >= 400) {
             const error = new Error(`No pude cargar el episodio. HTTP ${response.statusCode}`);
@@ -374,14 +398,7 @@ async function requestUrl(method, url, headers = {}, redirectCount = 0) {
     const client = getHttpClient(url);
     const request = client.request(
       url,
-      {
-        method,
-        timeout: REQUEST_TIMEOUT_MS,
-        headers: {
-          'User-Agent': USER_AGENT,
-          ...headers
-        }
-      },
+      buildRequestOptions(url, method, headers),
       (response) => {
         if (response.statusCode && isRedirectStatus(response.statusCode) && response.headers.location) {
           const redirectedUrl = normalizeUrl(response.headers.location, url);
@@ -612,17 +629,24 @@ async function fetchAniSkipTimings(episodeNumber) {
 
     const opening = payload.results.find((item) => item.skipType === 'op') || null;
     const ending = payload.results.find((item) => item.skipType === 'ed') || null;
-    const durationSec = ending?.episodeLength || opening?.episodeLength || DEFAULT_EPISODE_LENGTH_SEC;
+    const durationSec =
+      (ending && ending.episodeLength) || (opening && opening.episodeLength) || DEFAULT_EPISODE_LENGTH_SEC;
 
     return {
       source: 'AniSkip',
       animeId: aniskipAnimeId,
       episodeNumber,
       durationSec: durationSec ? Math.round(durationSec) : null,
-      introStartSec: opening?.interval?.startTime != null ? Math.round(opening.interval.startTime) : null,
-      introEndSec: opening?.interval?.endTime != null ? Math.round(opening.interval.endTime) : null,
-      outroStartSec: ending?.interval?.startTime != null ? Math.round(ending.interval.startTime) : null,
-      outroEndSec: ending?.interval?.endTime != null ? Math.round(ending.interval.endTime) : null,
+      introStartSec:
+        opening && opening.interval && opening.interval.startTime != null
+          ? Math.round(opening.interval.startTime)
+          : null,
+      introEndSec:
+        opening && opening.interval && opening.interval.endTime != null ? Math.round(opening.interval.endTime) : null,
+      outroStartSec:
+        ending && ending.interval && ending.interval.startTime != null ? Math.round(ending.interval.startTime) : null,
+      outroEndSec:
+        ending && ending.interval && ending.interval.endTime != null ? Math.round(ending.interval.endTime) : null,
       raw: payload
     };
   } catch (error) {
@@ -892,10 +916,10 @@ async function ensureEpisode(pool, seasonId, episodeData, timingData) {
       .input('videoUrl', episodeData.verifiedVideoUrl || null)
       .input('provider', provider)
       .input('thumbnailUrl', episodeData.pageImageUrl || episodeData.ogImageUrl)
-      .input('durationSec', timingData?.durationSec ?? null)
-      .input('introStartSec', timingData?.introStartSec ?? null)
-      .input('introEndSec', timingData?.introEndSec ?? null)
-      .input('outroStartSec', timingData?.outroStartSec ?? null)
+      .input('durationSec', timingData && timingData.durationSec != null ? timingData.durationSec : null)
+      .input('introStartSec', timingData && timingData.introStartSec != null ? timingData.introStartSec : null)
+      .input('introEndSec', timingData && timingData.introEndSec != null ? timingData.introEndSec : null)
+      .input('outroStartSec', timingData && timingData.outroStartSec != null ? timingData.outroStartSec : null)
       .query(`
         UPDATE dbo.Episodes
         SET
@@ -922,10 +946,10 @@ async function ensureEpisode(pool, seasonId, episodeData, timingData) {
     .input('videoUrl', episodeData.verifiedVideoUrl || null)
     .input('provider', provider)
     .input('thumbnailUrl', episodeData.pageImageUrl || episodeData.ogImageUrl)
-    .input('durationSec', timingData?.durationSec ?? null)
-    .input('introStartSec', timingData?.introStartSec ?? null)
-    .input('introEndSec', timingData?.introEndSec ?? null)
-    .input('outroStartSec', timingData?.outroStartSec ?? null)
+    .input('durationSec', timingData && timingData.durationSec != null ? timingData.durationSec : null)
+    .input('introStartSec', timingData && timingData.introStartSec != null ? timingData.introStartSec : null)
+    .input('introEndSec', timingData && timingData.introEndSec != null ? timingData.introEndSec : null)
+    .input('outroStartSec', timingData && timingData.outroStartSec != null ? timingData.outroStartSec : null)
     .query(`
       INSERT INTO dbo.Episodes (
         SeasonId,
@@ -996,11 +1020,11 @@ async function upsertSnapshot(pool, episodeData, timingData) {
     verifiedVideoContentType: episodeData.verifiedVideoContentType,
     verifiedVideoStatusCode: episodeData.verifiedVideoStatusCode,
     verifiedVideoReferer: episodeData.verifiedVideoReferer,
-    durationSec: timingData?.durationSec ?? null,
-    introStartSec: timingData?.introStartSec ?? null,
-    introEndSec: timingData?.introEndSec ?? null,
-    outroStartSec: timingData?.outroStartSec ?? null,
-    outroEndSec: timingData?.outroEndSec ?? null,
+    durationSec: timingData && timingData.durationSec != null ? timingData.durationSec : null,
+    introStartSec: timingData && timingData.introStartSec != null ? timingData.introStartSec : null,
+    introEndSec: timingData && timingData.introEndSec != null ? timingData.introEndSec : null,
+    outroStartSec: timingData && timingData.outroStartSec != null ? timingData.outroStartSec : null,
+    outroEndSec: timingData && timingData.outroEndSec != null ? timingData.outroEndSec : null,
     pageTitle: episodeData.pageTitle,
     metaDescription: episodeData.metaDescription,
     metaKeywords: episodeData.metaKeywords,
@@ -1194,7 +1218,9 @@ async function main(options = {}) {
   if (!episodeData.verifiedVideoUrl || episodeData.verifiedVideoUrl === NO_VIDEO_FOUND) {
     throw new Error(
       `Ningun servidor entrego un video reproducible para ${episodeData.episodePageUrl}` +
-        ` (se probaron ${episodeData.verificationAttempts?.length || 0} fuentes). No se guardo nada.`
+        ` (se probaron ${
+          episodeData.verificationAttempts ? episodeData.verificationAttempts.length : 0
+        } fuentes). No se guardo nada.`
     );
   }
   const timingData = await fetchAniSkipTimings(episodeData.episodeNumber);
@@ -1231,14 +1257,14 @@ async function main(options = {}) {
       savedVerifiedVideoReferer: episodeData.verifiedVideoReferer,
       seriesName: episodeData.seriesTitle,
       episodeTitle: episodeData.episodeTitle,
-      durationSec: timingData?.durationSec ?? null,
-      introStartSec: timingData?.introStartSec ?? null,
-      introEndSec: timingData?.introEndSec ?? null,
-      outroStartSec: timingData?.outroStartSec ?? null,
-      outroEndSec: timingData?.outroEndSec ?? null,
+      durationSec: timingData && timingData.durationSec != null ? timingData.durationSec : null,
+      introStartSec: timingData && timingData.introStartSec != null ? timingData.introStartSec : null,
+      introEndSec: timingData && timingData.introEndSec != null ? timingData.introEndSec : null,
+      outroStartSec: timingData && timingData.outroStartSec != null ? timingData.outroStartSec : null,
+      outroEndSec: timingData && timingData.outroEndSec != null ? timingData.outroEndSec : null,
       serversCaptured: episodeData.serverOptions.length,
       embedsCaptured: episodeData.playerEmbeds.length,
-      timingSource: timingData?.source || null
+      timingSource: (timingData && timingData.source) || null
     };
 
     if (options.emitJson !== false) {

@@ -40,6 +40,7 @@ const IDEAL_VIDEO_HEIGHT = 1080;
 const RESOLVABLE_HOST_HINTS = [
   'filelions',
   'vidhide',
+  'nupload',
   'streamwish',
   'swish',
   'wish',
@@ -257,6 +258,198 @@ const GNULA_ADAPTER = {
   buildEpisodeTitle: (_meta, episode) => `Capitulo ${episode.episodeNumber}`
 };
 
+function pelisflixContentTypeFromUrl(pageUrl) {
+  const path = new URL(pageUrl).pathname;
+  if (/^\/serie\//i.test(path)) return 'series';
+  if (/^\/pelicula\//i.test(path)) return 'movie';
+  return null;
+}
+
+function decodeBase64Url(value) {
+  try {
+    return Buffer.from(String(value || ''), 'base64').toString('utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+function parsePelisflixSearchResults(html, baseUrl) {
+  return matchAll(
+    html,
+    /<a href="(\/(?:pelicula|serie)\/[^"]+)">[\s\S]{0,700}?<h2 class="Title">([^<]+)<\/h2>/g,
+    (match) => ({
+      path: match[1],
+      url: normalizeUrl(match[1], baseUrl),
+      title: cleanText(match[2]),
+      contentType: match[1].startsWith('/pelicula/') ? 'movie' : 'series'
+    })
+  );
+}
+
+function parsePelisflixMetadata(html, pageUrl) {
+  const pageTitle = matchOne(html, /<title>([^<]+)<\/title>/i);
+  const metaDescription = matchOne(html, /<meta name="description" content="([^"]*)"/i);
+  const titleFromInfo = matchOne(html, /<p[^>]*style="[^"]*color:\s*#ff00f2[^"]*"[^>]*>([^<]+)<\/p>/i);
+  const originalTitle = matchOne(html, /Titulo\s+Original:\s*([^<]+)/i);
+  const title =
+    (titleFromInfo ? cleanText(titleFromInfo) : '') ||
+    cleanText(
+        String(pageTitle || '')
+          .replace(/^Ver\s+/i, '')
+        .replace(/\s+Online.*$/i, '')
+    ) ||
+    slugFromPageUrl(pageUrl);
+  const synopsis = matchOne(html, /<div class="Description"><p>([\s\S]*?)<\/p>/i);
+  const posterPath =
+    matchOne(html, /<img[^>]+data-src="([^"]*\/b\/v2\/[^"]+)"/i) ||
+    matchOne(html, /<img[^>]+data-src="([^"]*\/p\/v2\/[^"]+)"/i);
+  const yearText = matchOne(html, /<span class="Date">(\d{4})<\/span>/i);
+  const durationText = matchOne(html, /<span class="Time">([^<]+)<\/span>/i);
+
+  return {
+    pageTitle,
+    metaDescription,
+    metaKeywords: null,
+    title,
+    rawHeading: titleFromInfo || title,
+    originalTitle: originalTitle ? cleanText(originalTitle) : null,
+    synopsis: synopsis ? stripTags(synopsis) : metaDescription,
+    posterUrl: posterPath ? normalizeUrl(posterPath, pageUrl) : null,
+    releaseYear: yearText ? Number(yearText) : null,
+    rating: null,
+    genres: [
+      ...new Set(
+        matchAll(html, /<p class="Genre">[\s\S]*?<a href="[^"]+">([^<]+)<\/a>/g, (match) => cleanText(match[1]))
+      )
+    ].filter(Boolean),
+    actors: [
+      ...new Set(
+        matchAll(html, /<p class="Cast[\s\S]*?<a href="[^"]+">([^<]+)<\/a>/g, (match) => cleanText(match[1]))
+      )
+    ].filter(Boolean),
+    durationLabel: durationText ? cleanText(durationText) : null
+  };
+}
+
+function parsePelisflixPlayers(html) {
+  const seen = new Set();
+
+  return matchAll(
+    html,
+    /<div data-url="([^"]+)" class="Button sgty">[\s\S]{0,220}?<span class="nmopt">([^<]*)<\/span>[\s\S]{0,220}?<span>([^<]+)<span>([^<]+)<\/span>/g,
+    (match) => {
+      const embedUrl = decodeBase64Url(match[1]);
+      if (!embedUrl || seen.has(embedUrl)) return null;
+      seen.add(embedUrl);
+      return {
+        embedUrl,
+        language: cleanText(match[3]) || null,
+        server: cleanText(match[4]) || cleanText(match[2]) || hostLabel(embedUrl)
+      };
+    }
+  )
+    .filter(Boolean)
+    .map((item, index) => ({ index, ...item }));
+}
+
+function parsePelisflixSeasonLinks(html, pageUrl) {
+  const seen = new Set();
+
+  return matchAll(
+    html,
+    /<a href="(https?:\/\/[^"]*\/temporada\/[^"]+|\/temporada\/[^"]+)">Temporada\s*<span>(\d+)<\/span><\/a>/gi,
+    (match) => {
+      const url = normalizeUrl(match[1], pageUrl);
+      if (!url || seen.has(url)) return null;
+      seen.add(url);
+      return {
+        url,
+        seasonNumber: Number(match[2])
+      };
+    }
+  ).filter(Boolean);
+}
+
+function parsePelisflixEpisodes(html, pageUrl, fallbackSeasonNumber = null) {
+  const seen = new Set();
+
+  return matchAll(
+    html,
+    /<td><span class="Num">(\d+)<\/span><\/td>[\s\S]{0,400}?<td class="MvTbTtl"><a href="(https?:\/\/[^"]*\/episodio\/[^"]+|\/episodio\/[^"]+)">([^<]*)<\/a>/gi,
+    (match) => {
+      const episodeUrl = normalizeUrl(match[2], pageUrl);
+      if (!episodeUrl || seen.has(episodeUrl)) return null;
+
+      const urlMatch = episodeUrl.match(/-(\d+)x(\d+)\/?$/i);
+      const seasonNumber = urlMatch ? Number(urlMatch[1]) : Number(fallbackSeasonNumber);
+      const episodeNumber = urlMatch ? Number(urlMatch[2]) : Number(match[1]);
+      if (!seasonNumber || !episodeNumber) return null;
+
+      seen.add(episodeUrl);
+      return {
+        url: episodeUrl,
+        seasonNumber,
+        episodeNumber,
+        label: `${seasonNumber}x${episodeNumber}`,
+        title: cleanText(match[3]) || `Capitulo ${episodeNumber}`
+      };
+    }
+  ).filter(Boolean);
+}
+
+async function loadSeriesEpisodes(adapter, html, pageUrl) {
+  if (adapter.id !== 'pelisflix200') {
+    return adapter.parseSeasonEpisodes(html, pageUrl);
+  }
+
+  const directEpisodes = adapter.parseSeasonEpisodes(html, pageUrl);
+  if (directEpisodes.length) {
+    return directEpisodes;
+  }
+
+  const seasonLinks = parsePelisflixSeasonLinks(html, pageUrl);
+  if (!seasonLinks.length) {
+    return [];
+  }
+
+  const episodes = [];
+  const seen = new Set();
+
+  for (const season of seasonLinks) {
+    try {
+      const seasonHtml = await fetchPageHtml(season.url);
+      const seasonEpisodes = parsePelisflixEpisodes(seasonHtml, season.url, season.seasonNumber);
+      for (const episode of seasonEpisodes) {
+        const key = `${episode.seasonNumber}x${episode.episodeNumber}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        episodes.push(episode);
+      }
+    } catch (error) {
+      process.stderr.write(
+        `  ${adapter.sourceSite}: no pude leer la temporada ${season.seasonNumber} (${error.message || error})\n`
+      );
+    }
+  }
+
+  return episodes.sort((a, b) => a.seasonNumber - b.seasonNumber || a.episodeNumber - b.episodeNumber);
+}
+
+const PELISFLIX200_ADAPTER = {
+  id: 'pelisflix200',
+  sourceSite: 'Pelisflix200',
+  contentTypeFromUrl: pelisflixContentTypeFromUrl,
+  buildTitleUrl: (baseUrl, contentType, slug) =>
+    normalizeUrl(`${contentType === 'movie' ? 'pelicula' : 'serie'}/${slug}/`, baseUrl),
+  searchUrl: (baseUrl, title) => normalizeUrl(`?s=${encodeURIComponent(title)}`, baseUrl),
+  parseSearchResults: parsePelisflixSearchResults,
+  parseTitleMetadata: parsePelisflixMetadata,
+  parseSeasonEpisodes: parsePelisflixEpisodes,
+  parsePlayerOptions: parsePelisflixPlayers,
+  parseEpisodeNavigation: () => ({}),
+  buildEpisodeTitle: (_meta, episode) => `Capitulo ${episode.episodeNumber}`
+};
+
 // Cada sitio tiene su propio HTML, asi que lo especifico de cada uno vive en un
 // adaptador y el resto del importador (video, base de datos) es comun.
 function resolveAdapter(url) {
@@ -270,6 +463,7 @@ function resolveAdapter(url) {
   // Gnula va antes que la comprobacion de cuevana a proposito: su reproductor
   // vive en player.cuevana.ac, y por el nombre acabaria en el adaptador que no
   // es.
+  if (hostname.includes('pelisflix200')) return PELISFLIX200_ADAPTER;
   if (hostname.includes('pelismart')) return PELISMART_ADAPTER;
   if (hostname.includes('gnula')) return GNULA_ADAPTER;
   return hostname.includes('cuevana') ? CUEVANA3_ADAPTER : PELISPLUS_ADAPTER;
@@ -561,6 +755,40 @@ function parseCuevanaPlayers(html) {
         ? cleanText(item.server.replace(/^\d+\s*-\s*/, '').replace(/\s*-\s*HD$/i, ''))
         : hostLabel(item.embedUrl)
     }));
+}
+
+function pickPreferredPelisflixEmbed(playerOptions, preferredLanguage) {
+  const normalizedLanguage = cleanText(preferredLanguage || '').toUpperCase();
+  const byLanguage = normalizedLanguage
+    ? playerOptions.filter((option) => cleanText(option.language || '').toUpperCase() === normalizedLanguage)
+    : playerOptions.slice();
+  const pool = byLanguage.length ? byLanguage : playerOptions;
+
+  return (
+    pool.find((option) => /voe/i.test(option.server || '') || /\/iframe\//i.test(option.embedUrl || '')) ||
+    pool.find((option) => /principal/i.test(option.server || '') && /\/iframe\//i.test(option.embedUrl || '')) ||
+    pool[0] ||
+    null
+  );
+}
+
+function sortPelisflixEmbedsByPreference(playerOptions, preferredLanguage) {
+  const normalizedLanguage = cleanText(preferredLanguage || '').toUpperCase();
+  const languageRank = (option) => {
+    if (!normalizedLanguage) return 0;
+    return cleanText(option.language || '').toUpperCase() === normalizedLanguage ? 0 : 1;
+  };
+  const serverRank = (option) => {
+    const server = cleanText(option.server || '').toUpperCase();
+    const url = option.embedUrl || '';
+    if (/VOE/.test(server) || /\/iframe\//i.test(url)) return 0;
+    if (/PRINCIPAL/.test(server)) return 1;
+    return 2;
+  };
+
+  return playerOptions
+    .slice()
+    .sort((a, b) => languageRank(a) - languageRank(b) || serverRank(a) - serverRank(b) || a.index - b.index);
 }
 
 function parseCuevanaNavigation(html, pageUrl) {
@@ -1061,10 +1289,10 @@ async function inspectHlsQuality(url, referer) {
       const best = variants[0];
       const nested = await inspectHlsQuality(best.url, url);
       return {
-        width: best.width || nested?.width || null,
-        height: best.height || nested?.height || null,
-        bandwidth: best.bandwidth || nested?.bandwidth || null,
-        durationSec: nested?.durationSec || null
+        width: best.width || (nested && nested.width) || null,
+        height: best.height || (nested && nested.height) || null,
+        bandwidth: best.bandwidth || (nested && nested.bandwidth) || null,
+        durationSec: (nested && nested.durationSec) || null
       };
     }
 
@@ -1086,10 +1314,10 @@ async function enrichVerifiedVideo(verified, referer) {
   if (/mpegurl/i.test(verified.contentType || '') || /\.m3u8(?:$|\?)/i.test(verified.url || '')) {
     const quality = await inspectHlsQuality(verified.url, referer);
     if (quality) {
-      result.streamWidth = quality.width ?? null;
-      result.streamHeight = quality.height ?? null;
-      result.streamBandwidth = quality.bandwidth ?? null;
-      result.streamDurationSec = quality.durationSec ?? null;
+      result.streamWidth = quality.width != null ? quality.width : null;
+      result.streamHeight = quality.height != null ? quality.height : null;
+      result.streamBandwidth = quality.bandwidth != null ? quality.bandwidth : null;
+      result.streamDurationSec = quality.durationSec != null ? quality.durationSec : null;
     }
   }
 
@@ -1237,7 +1465,20 @@ async function resolveVerifiedVideo(playerOptions, pageUrl, options = {}) {
       continue;
     }
 
-    const directVerified = await resolveMediaCandidate(candidate.url, pageUrl, options, 0);
+    // Un host que contesta 403/404 tira una excepcion aqui dentro. Antes esa
+    // excepcion se escapaba de todo el bucle, asi que el primer servidor muerto
+    // del capitulo se llevaba por delante a los que venian despues: en Rick y
+    // Morty, doodstream reventaba con 403 y streamwish -que si tenia el m3u8-
+    // no llegaba a probarse nunca, y el capitulo terminaba guardado como embed.
+    let directVerified = null;
+    try {
+      directVerified = await resolveMediaCandidate(candidate.url, pageUrl, options, 0);
+    } catch (error) {
+      if (/tiempo de espera|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|socket hang up/i.test(error.message || '')) {
+        unreachableHosts.add(hostOf(candidate.url));
+      }
+    }
+
     if (directVerified) {
       const current = {
         videoSrcUrl: candidate.url,
@@ -1382,7 +1623,8 @@ function frameInterno(html, embedUrl) {
   if (!encontrado) return null;
   try {
     const destino = new URL(encontrado[1], embedUrl);
-    if (destino.hostname !== new URL(embedUrl).hostname) return null;  // publicidad de terceros
+    if (!/^https?:$/i.test(destino.protocol)) return null;
+    if (destino.toString() === embedUrl) return null;
     return destino.toString();
   } catch {
     return null;
@@ -1439,6 +1681,10 @@ const SITIOS_ALTERNATIVOS = [
   'https://pelismart.mov/',
   'https://www2.gnula.one/'
 ];
+const SITIOS_ALTERNATIVOS_PELICULAS = [
+  ...SITIOS_ALTERNATIVOS,
+  'https://pelisflix200.ws/'
+];
 
 // Prepara los otros sitios una sola vez: buscar el titulo en cada uno y quedarse
 // con un indice "TxE" -> url. Hacerlo por capitulo seria una busqueda por
@@ -1451,12 +1697,16 @@ async function prepararAlternativas(contentType, titulo, urlPrincipal) {
     if (new URL(baseUrl).hostname === hostPrincipal) continue;
 
     try {
+      // searchTitle devuelve la coincidencia en plano, no envuelta en .match:
+      // leerla como encontrado.match.strong daba undefined siempre, asi que
+      // este continue se disparaba en todos los sitios y la lista de respaldo
+      // volvia vacia. El rescate existia pero no se ejecutaba nunca.
       const encontrado = await searchTitle({ baseUrl, contentType, title: titulo });
-      if (!encontrado || !encontrado.match || !encontrado.match.strong) continue;
+      if (!isStrongMatch(encontrado)) continue;
 
-      const adaptador = resolveAdapter(encontrado.match.url);
-      const html = await fetchPageHtml(encontrado.match.url);
-      const capitulos = adaptador.parseSeasonEpisodes(html, encontrado.match.url);
+      const adaptador = resolveAdapter(encontrado.url);
+      const html = await fetchPageHtml(encontrado.url);
+      const capitulos = await loadSeriesEpisodes(adaptador, html, encontrado.url);
       if (!capitulos.length) continue;
 
       const indice = new Map();
@@ -1552,7 +1802,7 @@ async function buscarPeliculaEnAlternativas(contentType, titulo, urlPrincipal, o
   const preferNative = options.preferNative === true;
   let mejorEmbed = null;
 
-  for (const baseUrl of SITIOS_ALTERNATIVOS) {
+  for (const baseUrl of SITIOS_ALTERNATIVOS_PELICULAS) {
     if (new URL(baseUrl).hostname === hostPrincipal) continue;
 
     try {
@@ -1694,11 +1944,14 @@ async function ensureSeries(pool, titleData, adapter) {
     .request()
     .input('sourceRef', sourceRef)
     .input('title', titleData.title)
+    .input('originalTitle', titleData.originalTitle || null)
     .input('contentType', titleData.contentType)
     .query(`
       SELECT TOP 1 Id
       FROM dbo.Series
-      WHERE SourceRef = @sourceRef OR (Title = @title AND ContentType = @contentType)
+      WHERE SourceRef = @sourceRef
+         OR (Title = @title AND ContentType = @contentType)
+         OR (@originalTitle IS NOT NULL AND Title = @originalTitle AND ContentType = @contentType)
       ORDER BY Id ASC
     `);
 
@@ -1830,7 +2083,7 @@ async function ensureEpisode(pool, seasonId, episodeData) {
       .input('videoUrl', episodeData.videoUrl)
       .input('provider', episodeData.provider)
       .input('thumbnailUrl', episodeData.thumbnailUrl)
-      .input('durationSec', episodeData.durationSec ?? null)
+      .input('durationSec', episodeData.durationSec != null ? episodeData.durationSec : null)
       .query(`
         UPDATE dbo.Episodes
         SET
@@ -1854,7 +2107,7 @@ async function ensureEpisode(pool, seasonId, episodeData) {
     .input('videoUrl', episodeData.videoUrl)
     .input('provider', episodeData.provider)
     .input('thumbnailUrl', episodeData.thumbnailUrl)
-    .input('durationSec', episodeData.durationSec ?? null)
+    .input('durationSec', episodeData.durationSec != null ? episodeData.durationSec : null)
     .query(`
       INSERT INTO dbo.Episodes (
         SeasonId,
@@ -2119,7 +2372,7 @@ async function importMovie(pool, context, options) {
     videoUrl: playback.videoUrl,
     provider: playback.provider,
     thumbnailUrl: titleData.posterUrl,
-    durationSec: verification?.streamDurationSec ?? null
+    durationSec: verification && verification.streamDurationSec != null ? verification.streamDurationSec : null
   });
 
   const snapshotId = await upsertSnapshot(pool, {
@@ -2135,8 +2388,8 @@ async function importMovie(pool, context, options) {
     episodeNumber: 1,
     episodeTitle: titleData.title,
     episodePageUrl: pageUrl,
-    primaryVideoUrl: playerOptions[0]?.embedUrl || null,
-    primaryVideoSource: playerOptions[0]?.server || null,
+    primaryVideoUrl: (playerOptions[0] && playerOptions[0].embedUrl) || null,
+    primaryVideoSource: (playerOptions[0] && playerOptions[0].server) || null,
     savedProvider: playback.provider,
     pageTitle: titleData.pageTitle,
     metaDescription: titleData.metaDescription,
@@ -2176,7 +2429,7 @@ async function importMovie(pool, context, options) {
 
 async function importSeries(pool, context, options) {
   const { titleData, html, pageUrl, adapter } = context;
-  const allEpisodes = adapter.parseSeasonEpisodes(html, pageUrl);
+  const allEpisodes = await loadSeriesEpisodes(adapter, html, pageUrl);
 
   if (!allEpisodes.length) {
     throw new Error(`No encontre capitulos listados para "${titleData.title}" en ${pageUrl}`);
@@ -2200,6 +2453,13 @@ async function importSeries(pool, context, options) {
 
     return seriesId;
   };
+
+  // Un embed sin video verificado es una fila muerta: no pasa por el proxy de
+  // StreamFlix, se mete en un iframe y lo que se reproduce es lo que el sitio
+  // decida poner ahi — normalmente el trailer. Antes se aceptaba en callado
+  // para pelisflix200, que es de donde salieron los ~210 episodios con
+  // NO_VIDEO_FOUND en el catalogo. Ahora hay que pedirlo con --permitir-embed.
+  const allowEmbed = options.allowEmbed === true;
 
   const seasonIds = new Map();
   const imported = [];
@@ -2227,13 +2487,26 @@ async function importSeries(pool, context, options) {
       episodeHtml = await fetchPageHtml(episode.url);
       playerOptions = adapter.parsePlayerOptions(episodeHtml);
       if (playerOptions.length) {
-        verification = await resolveVerifiedVideo(playerOptions, episode.url, { contentType: 'series' });
-        playback = await pickPlayback(playerOptions, verification, episode.url);
+        // pelisflix200 publica el mismo capitulo en varios idiomas, asi que se
+        // ordena para que LATINO entre primero. Lo que NO se hace ya es saltarse
+        // la extraccion: antes este sitio tenia un camino aparte que agarraba el
+        // primer embed que respondiera y lo guardaba con NO_VIDEO_FOUND escrito
+        // a mano, de modo que ninguna serie suya llegaba jamas al player propio.
+        const orderedOptions = adapter.id === 'pelisflix200'
+          ? sortPelisflixEmbedsByPreference(playerOptions, 'LATINO')
+          : playerOptions;
+
+        verification = await resolveVerifiedVideo(orderedOptions, episode.url, { contentType: 'series' });
+        playback = await pickPlayback(orderedOptions, verification, episode.url, { allowEmbed });
       }
     } catch (error) {
       process.stderr.write(`    ${adapter.sourceSite}: ${error.message || error}\n`);
     }
 
+    // Un embed siempre vale la pena intentar cambiarlo por un HLS de otro sitio:
+    // antes, cuando el sitio de origen era pelisflix200 se daba por bueno el
+    // embed y ni se miraban los respaldos, que es como Rick y Morty acabo
+    // entero fuera del reproductor propio.
     const necesitaRescate = !playback || playback.provider === 'embed';
     if (necesitaRescate) {
       const rescate = await buscarEnAlternativas(await alternativasListas(), episode, { preferNative: true });
@@ -2244,12 +2517,14 @@ async function importSeries(pool, context, options) {
       }
     }
 
-    if (!playback || playback.provider === 'embed') {
+    if (!playback || (playback.provider === 'embed' && !allowEmbed)) {
       skipped.push({
         ...episode,
-        reason: playerOptions.length
-          ? 'No encontre un HLS/archivo reproducible para el player propio, tampoco en los otros sitios.'
-          : 'El capitulo no tiene reproductores publicados en ningun sitio.'
+        reason: !playerOptions.length
+          ? 'El capitulo no tiene reproductores publicados en ningun sitio.'
+          : playback
+            ? 'Solo quedo un embed sin video verificado; no se guarda (usa --permitir-embed si lo quieres igual).'
+            : 'No encontre un HLS/archivo reproducible para el player propio, tampoco en los otros sitios.'
       });
       continue;
     }
@@ -2272,7 +2547,7 @@ async function importSeries(pool, context, options) {
       videoUrl: playback.videoUrl,
       provider: playback.provider,
       thumbnailUrl: episodeMeta.posterUrl || titleData.posterUrl,
-      durationSec: verification?.streamDurationSec ?? null
+      durationSec: verification && verification.streamDurationSec != null ? verification.streamDurationSec : null
     });
 
     const snapshotId = await upsertSnapshot(pool, {
@@ -2288,8 +2563,8 @@ async function importSeries(pool, context, options) {
       episodeNumber: episode.episodeNumber,
       episodeTitle,
       episodePageUrl: urlDelCapitulo,
-      primaryVideoUrl: playerOptions[0]?.embedUrl || null,
-      primaryVideoSource: playerOptions[0]?.server || null,
+      primaryVideoUrl: (playerOptions[0] && playerOptions[0].embedUrl) || null,
+      primaryVideoSource: (playerOptions[0] && playerOptions[0].server) || null,
       savedProvider: playback.provider,
       pageTitle: episodeMeta.pageTitle,
       metaDescription: episodeMeta.metaDescription,
@@ -2329,7 +2604,7 @@ async function importSeries(pool, context, options) {
   }
 
   if (!imported.length) {
-    const detail = skipped[0]?.reason ? ` Motivo del primero: ${skipped[0].reason}` : '';
+    const detail = skipped[0] && skipped[0].reason ? ` Motivo del primero: ${skipped[0].reason}` : '';
     throw new Error(
       `Ningun capitulo de "${titleData.title}" tenia video disponible, no se guardo nada.${detail}`
     );
@@ -2392,7 +2667,7 @@ async function main(options = {}) {
       releaseYear: titleData.releaseYear,
       rating: titleData.rating,
       genres: titleData.genres,
-      episodesDetected: outcome.episodesDetected ?? outcome.imported.length,
+      episodesDetected: outcome.episodesDetected != null ? outcome.episodesDetected : outcome.imported.length,
       seasonCoverage: outcome.seasonCoverage || [],
       importedCount: outcome.imported.length,
       skippedCount: outcome.skipped.length,
@@ -2418,6 +2693,7 @@ if (require.main === module) {
     season: args.season,
     start: args.start,
     end: args.end,
+    allowEmbed: args['permitir-embed'] === 'true',
     onProgress: (event) =>
       process.stderr.write(
         `→ T${event.seasonNumber}E${event.episodeNumber} (${event.provider})${

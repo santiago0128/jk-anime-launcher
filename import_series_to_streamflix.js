@@ -14,17 +14,33 @@ const {
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const JKANIME_BASE_URL = 'https://jkanime.net/';
-const PELISPLUS_HOME_URL = 'https://ww9.cuevana3.to/';
-// Si un titulo no aparece en el sitio principal se busca en los demas, en orden.
+const PELISPLUS_HOME_URL = 'https://pelismart.mov/';
+// Para series y peliculas conviene entrar primero por PelisPlusHD: es el sitio
+// que el bot abre en modo interactivo y, en casos como Rick y Morty, expone un
+// HLS que reproduce el player propio mientras Cuevana solo deja un embed de
+// Streamwish. Si ahi no hay video, entonces se cae a los demas en orden.
 // Agregar uno nuevo aqui solo funciona si tiene adaptador en
 // save_pelisplus_to_streamflix.js, que es quien sabe leer su HTML.
 // Gnula va la ultima: solo tiene el reproductor incrustado, sin portada ni
 // sinopsis, asi que solo debe entrar cuando los demas no tienen video.
-const CONTENT_SITES = [PELISPLUS_HOME_URL, 'https://www.pelisplushd.la/', 'https://pelismart.mov/', 'https://www2.gnula.one/'];
+const SERIES_CONTENT_SITES = [
+  PELISPLUS_HOME_URL,
+  'https://www.pelisplushd.la/',
+  'https://pelisflix200.ws/',
+  'https://ww9.cuevana3.to/',
+  'https://www2.gnula.one/'
+];
+const MOVIE_CONTENT_SITES = [
+  ...SERIES_CONTENT_SITES
+];
 const PELISPLUS_PATH_BY_TYPE = {
   series: 'serie',
   movie: 'pelicula'
 };
+
+function getContentSites(contentType) {
+  return contentType === 'movie' ? MOVIE_CONTENT_SITES : SERIES_CONTENT_SITES;
+}
 function parseArgs(argv) {
   const args = {};
 
@@ -186,6 +202,30 @@ function titleFromSlug(slug) {
     .join(' ');
 }
 
+function titleVariants(title) {
+  const base = cleanText(title || '');
+  if (!base) return [];
+
+  const variants = [];
+  const push = (value) => {
+    const normalized = cleanText(value || '');
+    if (!normalized) return;
+    if (!variants.some((item) => item.toLowerCase() === normalized.toLowerCase())) {
+      variants.push(normalized);
+    }
+  };
+
+  if (/\sy\s/i.test(base)) {
+    push(base.replace(/\sy\s/gi, ' and '));
+  }
+  if (/\sand\s/i.test(base)) {
+    push(base.replace(/\sand\s/gi, ' y '));
+  }
+  push(base);
+
+  return variants;
+}
+
 function episodeUrl(baseSeriesUrl, episodeNumber) {
   const normalized = baseSeriesUrl.endsWith('/') ? baseSeriesUrl : `${baseSeriesUrl}/`;
   return `${normalized}${episodeNumber}/`;
@@ -225,7 +265,7 @@ function buildPelisplusUrl(contentType, title) {
 
 function findOnPelisplus(contentType, title) {
   if (!PELISPLUS_PATH_BY_TYPE[contentType]) return Promise.resolve({ attempts: [] });
-  return searchTitleAcrossSites({ contentType, title, baseUrls: CONTENT_SITES });
+  return searchTitleAcrossSites({ contentType, title, baseUrls: getContentSites(contentType) });
 }
 
 function getBrowserTargetUrl(contentType, animeUrl = null, title = null) {
@@ -249,16 +289,17 @@ async function findSeriesOnJkAnime(seriesName) {
 
   const normalizedTarget = cleanText(seriesName).toLowerCase();
   const exactSeries = candidates.find(
-    (item) => item.type?.toLowerCase() === 'serie' && item.title.toLowerCase() === normalizedTarget
+    (item) => item.type && item.type.toLowerCase() === 'serie' && item.title.toLowerCase() === normalizedTarget
   );
   if (exactSeries) return exactSeries;
 
   const containingSeries = candidates.find(
-    (item) => item.type?.toLowerCase() === 'serie' && item.title.toLowerCase().includes(normalizedTarget)
+    (item) =>
+      item.type && item.type.toLowerCase() === 'serie' && item.title.toLowerCase().includes(normalizedTarget)
   );
   if (containingSeries) return containingSeries;
 
-  const firstSeries = candidates.find((item) => item.type?.toLowerCase() === 'serie');
+  const firstSeries = candidates.find((item) => item.type && item.type.toLowerCase() === 'serie');
   if (firstSeries) return firstSeries;
 
   throw new Error(`No encontre una serie para "${seriesName}" en JK Anime.`);
@@ -471,8 +512,8 @@ async function queryAniList(seriesName) {
     });
 
     const payload = JSON.parse(body);
-    const media = payload?.data?.Media;
-    if (!media?.id) {
+    const media = payload && payload.data ? payload.data.Media : null;
+    if (!media || !media.id) {
       return null;
     }
 
@@ -481,7 +522,11 @@ async function queryAniList(seriesName) {
       aniListId: media.id,
       releaseYear: media.seasonYear || null,
       rating: media.averageScore ? Number((media.averageScore / 10).toFixed(1)) : null,
-      matchedTitle: media.title?.english || media.title?.romaji || media.title?.native || seriesName
+      matchedTitle:
+        (media.title && media.title.english) ||
+        (media.title && media.title.romaji) ||
+        (media.title && media.title.native) ||
+        seriesName
     };
   } catch {
     return null;
@@ -654,10 +699,10 @@ async function main() {
       );
     }
 
-    const targetUrl = pageUrlArg || match?.url || getBrowserTargetUrl(contentType, null, titleArg);
+    const targetUrl = pageUrlArg || (match && match.url) || getBrowserTargetUrl(contentType, null, titleArg);
     if (shouldOpenBrowser(args)) openUrlInBrowser(targetUrl);
 
-    const nombreMostrado = match?.title || titleArg || targetUrl;
+    const nombreMostrado = (match && match.title) || titleArg || targetUrl;
     escribirProgreso({
       estado: 'importando',
       tipo: label,
@@ -669,31 +714,34 @@ async function main() {
 
     const iniciado = new Date().toISOString();
 
-    // Que un sitio publique la ficha no quiere decir que tenga video. Cuando
-    // se queda sin reproductor se prueba el siguiente sitio con la misma
-    // pelicula, en vez de dar el titulo por perdido.
-    const sinVideo = (error) => /no expone ningun reproductor/i.test(error?.message || '');
     // Sin coincidencia del buscador se arma la URL a mano, y entonces hay que
     // armarla para todos los sitios: cuando el buscador de uno deja de
     // funcionar, esta es la unica via que queda para llegar al otro.
     const porUrlDirecta = () =>
-      CONTENT_SITES.map((baseUrl) => ({ url: buildTitleUrl({ baseUrl, contentType, title: titleArg }), baseUrl })).filter(
-        (item) => item.url
-      );
+      getContentSites(contentType).flatMap((baseUrl) =>
+        titleVariants(titleArg).map((variantTitle) => ({
+          url: buildTitleUrl({ baseUrl, contentType, title: variantTitle }),
+          baseUrl,
+          variantTitle
+        }))
+      ).filter((item) => item.url);
 
     let candidatos;
     if (pageUrlArg) {
-      candidatos = [{ url: pageUrlArg, baseUrl: match?.baseUrl || PELISPLUS_HOME_URL }];
-    } else if (match?.url) {
-      // Los sitios sin buscador utilizable nunca aparecen entre los resultados,
-      // asi que se añaden por URL directa detras de los que si buscaron. Sin
-      // esto, un sitio como Gnula solo entraba cuando fallaban todos los
-      // buscadores a la vez, que es justo cuando menos falta hace.
-      const yaEstan = new Set([match.baseUrl, ...(match.alternativas || []).map((item) => item.baseUrl)]);
+      candidatos = [{ url: pageUrlArg, baseUrl: (match && match.baseUrl) || PELISPLUS_HOME_URL }];
+    } else if (match && match.url) {
+      // Primero se prueban las URL directas plausibles del titulo. El buscador
+      // a veces devuelve una ficha valida pero mas pobre en reproductores que
+      // otra URL del mismo sitio armada con el titulo original.
+      const yaEstan = new Set([
+        match.url,
+        ...(match.alternativas || []).map((item) => item.url)
+      ]);
       candidatos = [
+        ...porUrlDirecta().filter((item) => !yaEstan.has(item.url)),
         { url: match.url, baseUrl: match.baseUrl },
         ...(match.alternativas || []),
-        ...porUrlDirecta().filter((item) => !yaEstan.has(item.baseUrl))
+        ...porUrlDirecta().filter((item) => !yaEstan.has(item.url))
       ];
     } else {
       candidatos = porUrlDirecta();
@@ -708,6 +756,7 @@ async function main() {
         season: args.season,
         start: args.start,
         end: args.end,
+        allowEmbed: args['permitir-embed'] === 'true',
         emitJson: false,
         onProgress: (event) => {
           process.stderr.write(
@@ -734,8 +783,10 @@ async function main() {
         result = await importarDesde(candidato);
         break;
       } catch (error) {
-        if (sinVideo(error) && !ultimo) {
-          process.stderr.write(`· ${candidato.baseUrl} no tiene video para "${nombreMostrado}", pruebo el siguiente sitio\n`);
+        if (!ultimo) {
+          process.stderr.write(
+            `· ${candidato.url} fallo (${(error && error.message) || error}), pruebo el siguiente candidato\n`
+          );
           continue;
         }
         escribirProgreso({ estado: 'error', tipo: label, titulo: nombreMostrado, motivo: error.message, iniciado });
@@ -758,10 +809,10 @@ async function main() {
         {
           ...result,
           searchedTitle: titleArg || null,
-          matchedTitle: match?.title || null,
+          matchedTitle: (match && match.title) || null,
           matchedInSearch: Boolean(match),
-          matchedSite: match?.baseUrl || null,
-          matchScore: match?.score != null ? Number(match.score.toFixed(2)) : null,
+          matchedSite: (match && match.baseUrl) || null,
+          matchScore: match && match.score != null ? Number(match.score.toFixed(2)) : null,
           openedUrl: targetUrl
         },
         null,
@@ -894,9 +945,9 @@ async function importarFicha({ jkSeries, ficha, args, seriesName, contentType, f
     seriesName: jkSeries.title,
     seriesUrl: jkSeries.url.endsWith('/') ? jkSeries.url : `${jkSeries.url}/`,
     seriesSlug: slugFromUrl(jkSeries.url),
-    aniskipId: aniList?.id || null,
-    releaseYear: aniList?.releaseYear || null,
-    rating: aniList?.rating || null,
+    aniskipId: (aniList && aniList.id) || null,
+    releaseYear: (aniList && aniList.releaseYear) || null,
+    rating: (aniList && aniList.rating) || null,
     // Todo va bajo la misma ficha de catálogo; esta entra como una temporada.
     franquicia: franquicia.nombre,
     referencia: franquicia.referencia,
