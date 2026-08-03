@@ -80,6 +80,41 @@ async function loadReferers(pool) {
   return referers;
 }
 
+// Lo que devuelve un embed que ya no sirve para nada. Todo esto llega con
+// codigo 200, que es justo por lo que hay que mirar el cuerpo:
+//   - el propio host avisando de que el archivo caduco o se borro;
+//   - el dominio incautado, que redirige a una pagina antipirateria;
+//   - una pagina minuscula, que es la forma que tienen de decir "aqui no hay
+//     nada" sin gastar un 404 (el stub de streamwish son 452 bytes).
+const AVISOS_DE_MUERTO = [
+  /no longer available/i,
+  /has been deleted/i,
+  /file (?:not found|was deleted|is expired)/i,
+  /video (?:not found|has been removed|unavailable)/i,
+  /this file (?:is|was) removed/i,
+  /alliance4creativity|watch-it-legally/i,
+  /domain (?:seized|has been seized)/i
+];
+
+function motivoEmbedMuerto(response) {
+  const cuerpo = String(response.body || '');
+  const destino = String(response.finalUrl || response.url || '');
+
+  for (const patron of AVISOS_DE_MUERTO) {
+    if (patron.test(cuerpo) || patron.test(destino)) {
+      const encontrado = (cuerpo.match(patron) || destino.match(patron) || [''])[0];
+      return `el host responde 200 pero dice: "${String(encontrado).slice(0, 60)}"`;
+    }
+  }
+
+  // Un reproductor real trae su JS y su maquetado; nada util cabe en tan poco.
+  if (cuerpo.length > 0 && cuerpo.length < 600) {
+    return `el host devuelve una pagina de ${cuerpo.length} bytes, sin reproductor`;
+  }
+
+  return null;
+}
+
 async function probeEpisode(episode, referers) {
   const provider = String(episode.Provider || 'file').toLowerCase();
   const url = episode.VideoUrl;
@@ -101,8 +136,12 @@ async function probeEpisode(episode, referers) {
     const contentType = response.headers['content-type'] || '';
 
     if (provider === 'embed') {
-      // Un embed solo se puede comprobar hasta el punto de que el servidor
-      // responda; lo que pase dentro del iframe ya no se ve desde aqui.
+      // Que el servidor conteste 200 no basta, y darlo por bueno era lo que
+      // hacia pasar la revision a series que no reproducen nada: estos hosts
+      // sirven su pagina de "archivo caducado" con codigo 200, y cuando cierran
+      // un dominio lo reemplazan por un aviso antipirateria, tambien con 200.
+      const muerto = motivoEmbedMuerto(response);
+      if (muerto) return { estado: 'caducado', detalle: muerto };
       return { estado: 'ok', detalle: `embed responde (${response.statusCode})` };
     }
 

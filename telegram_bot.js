@@ -53,7 +53,8 @@ const AYUDA = [
   '<b>Consultar</b>',
   '/estado — cómo va la importación en curso',
   '/catalogo — qué hay guardado',
-  '/revisar — busca enlaces caducados',
+  '/revisar — comprueba qué enlaces siguen vivos',
+  '   <code>/revisar arreglar</code> reimporta los que estén vencidos',
   '/ayuda'
 ].join('\n');
 
@@ -441,12 +442,30 @@ async function atender(mensaje) {
 
   if (comando === '/revisar') {
     if (ocupado) return responder(chatId, `⏳ Ya hay algo en curso: ${ocupado}`);
-    ocupado = 'revisión de enlaces';
-    await responder(chatId, '🔍 Revisando qué enlaces siguen vivos, tarda un rato…');
-    const salida = await ejecutarScript('check_streamflix_links.js', [], chatId);
+
+    // Revisar y arreglar son la misma comprobación; lo que cambia es si al
+    // encontrar un enlace muerto se vuelve a importar el título. Reimportar
+    // puede ser una noche de descargas, así que no se hace sin pedirlo.
+    const arreglar = /^(arreglar|arregla|fix|reparar)$/i.test(String(argumento || '').trim());
+
+    ocupado = arreglar ? 'revisión y refresco de enlaces' : 'revisión de enlaces';
+    await responder(chatId, arreglar
+      ? '🔧 Revisando enlaces y reimportando los que estén vencidos. Esto tarda: te aviso al terminar.'
+      : '🔍 Revisando qué enlaces siguen vivos, tarda un rato…');
+
+    const salida = await ejecutarScript('check_streamflix_links.js', arreglar ? ['--fix'] : [], chatId);
     ocupado = null;
+
     const resumen = salida.split('\n').filter((l) => /^[✓✗]/.test(l)).join('\n') || salida.slice(-1500);
-    return responder(chatId, `<b>Revisión terminada</b>\n<pre>${resumen.slice(0, 3000)}</pre>`);
+    const rotos = (salida.match(/(\d+)\s+t[ií]tulo\(s\) con problemas/) || [])[1];
+
+    // Si hay enlaces vencidos, decir cómo se arreglan: el dato por sí solo no
+    // sirve de nada si hay que ir a buscar el comando a la ayuda.
+    const consejo = !arreglar && rotos && Number(rotos) > 0
+      ? `\n\n⚠️ <b>${rotos} título(s) con enlaces vencidos.</b>\nRefréscalos con <code>/revisar arreglar</code>.`
+      : '';
+
+    return responder(chatId, `<b>Revisión terminada</b>\n<pre>${resumen.slice(0, 2600)}</pre>${consejo}`);
   }
 
   if (['/serie', '/pelicula', '/anime'].includes(comando)) {
