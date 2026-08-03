@@ -1210,8 +1210,14 @@ async function linkSeriesGenres(pool, seriesId, genreIds) {
   }
 }
 
-async function ensureSeries(pool, titleData) {
-  const sourceRef = `pelisplushd:${titleData.slug}`;
+async function ensureSeries(pool, titleData, adapter) {
+  // El prefijo dice de que sitio salio la serie, y es lo que usa la revision de
+  // enlaces para saber donde reimportarla. Estaba fijo en "pelisplushd" viniera
+  // de donde viniera, asi que una serie traida de Pelismart o Cuevana3 quedaba
+  // etiquetada como de PelisPlusHD y al refrescarla se buscaba en el sitio
+  // equivocado: en el mejor caso no la encontraba, y en el peor la reimportaba
+  // sin reproductores y la dejaba peor que antes.
+  const sourceRef = `${(adapter && adapter.id) || 'pelisplushd'}:${titleData.slug}`;
   const existing = await pool
     .request()
     .input('sourceRef', sourceRef)
@@ -1602,7 +1608,7 @@ async function importMovie(pool, context, options) {
     throw new Error(`La pelicula "${titleData.title}" no expone ningun reproductor en ${adapter.sourceSite}.`);
   }
 
-  const seriesId = await ensureSeries(pool, titleData);
+  const seriesId = await ensureSeries(pool, titleData, adapter);
   if (titleData.genres.length) {
     await linkSeriesGenres(pool, seriesId, await ensureGenres(pool, titleData.genres));
   }
@@ -1690,7 +1696,7 @@ async function importSeries(pool, context, options) {
   let seriesId = null;
   const ensureSeriesOnce = async () => {
     if (seriesId == null) {
-      seriesId = await ensureSeries(pool, titleData);
+      seriesId = await ensureSeries(pool, titleData, adapter);
       if (titleData.genres.length) {
         await linkSeriesGenres(pool, seriesId, await ensureGenres(pool, titleData.genres));
       }

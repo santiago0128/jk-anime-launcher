@@ -298,7 +298,15 @@ async function main() {
       return;
     }
 
-    const sitesByPrefix = { pelisplushd: 'https://www.pelisplushd.la/', cuevana3: 'https://ww9.cuevana3.to/' };
+    // Los cuatro sitios que sabe leer el importador. Faltaban dos, asi que una
+    // serie traida de Pelismart o Gnula no se podia reimportar: reimportTarget
+    // no encontraba su prefijo y la daba por irrecuperable.
+    const sitesByPrefix = {
+      pelisplushd: 'https://www.pelisplushd.la/',
+      cuevana3: 'https://ww9.cuevana3.to/',
+      pelismart: 'https://pelismart.mov/',
+      gnula: 'https://www2.gnula.one/'
+    };
 
     log('\nReimportando los títulos rotos…');
     for (const serie of rotas) {
