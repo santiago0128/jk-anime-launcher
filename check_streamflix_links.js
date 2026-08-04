@@ -13,6 +13,7 @@ const { main: importFromSite } = require('./save_pelisplus_to_streamflix.js');
 // y el token caduca por lote de importacion: con unos pocos por serie alcanza
 // para saber si esa serie sigue viva.
 const DEFAULT_SAMPLE = 3;
+const STREAMFLIX_URL = String(process.env.STREAMFLIX_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
 
 function parseArgs(argv) {
   const args = {};
@@ -114,7 +115,110 @@ function motivoEmbedMuerto(response) {
   return null;
 }
 
+function bloqueoDeIframe(response, pageUrl) {
+  const headers = response && response.headers ? response.headers : {};
+  const body = String(response.body || '');
+  const finalUrl = String(response.finalUrl || response.url || pageUrl || '');
+  const hostFinal = (() => {
+    try {
+      return new URL(finalUrl).hostname;
+    } catch {
+      return '';
+    }
+  })();
+
+  const xFrame = String(headers['x-frame-options'] || '');
+  if (/deny|sameorigin/i.test(xFrame)) {
+    return `bloquea iframe por X-Frame-Options: ${xFrame}`;
+  }
+
+  const csp = String(headers['content-security-policy'] || '');
+  const frameAncestors = csp.match(/frame-ancestors\s+([^;]+)/i);
+  if (frameAncestors && !/\*/.test(frameAncestors[1])) {
+    return `bloquea iframe por CSP: ${frameAncestors[1].trim()}`;
+  }
+
+  if (/window\.self\s*===\s*window\.top/i.test(body) || /document\.documentElement\.innerHTML\s*=\s*''/i.test(body)) {
+    return 'el reproductor detecta ventana superior y se vacía fuera del iframe esperado';
+  }
+
+  if (hostFinal && /pelismart\.|embed69\./i.test(hostFinal)) {
+    return `usa ${hostFinal}, que no se deja embeber desde Noxis`;
+  }
+
+  return null;
+}
+
+function esPlaylistValido(response) {
+  const contentType = String(response.headers['content-type'] || '');
+  return /mpegurl/i.test(contentType) || String(response.body || '').trimStart().startsWith('#EXTM3U');
+}
+
+function esVideoValido(response) {
+  const contentType = String(response.headers['content-type'] || '');
+  return /^video\//i.test(contentType) || /octet-stream/i.test(contentType);
+}
+
+async function probePlaybackResuelto(episode) {
+  const playbackUrl = `${STREAMFLIX_URL}/api/episodes/${episode.EpisodeId}/playback`;
+  try {
+    const playback = await requestUrl('GET', playbackUrl, { Accept: 'application/json' });
+    if (playback.statusCode >= 400) {
+      return { estado: 'roto', detalle: `playback respondió ${playback.statusCode}` };
+    }
+
+    let data;
+    try {
+      data = JSON.parse(playback.body || '{}');
+    } catch {
+      return { estado: 'roto', detalle: 'playback devolvió JSON inválido' };
+    }
+
+    if (!data || !data.url) {
+      return { estado: 'sin-fuente', detalle: 'playback no devolvió ninguna URL' };
+    }
+
+    if (data.provider === 'embed') {
+      const embedResponse = await requestUrl('GET', data.url, {
+        Accept: '*/*',
+        Referer: `${STREAMFLIX_URL}/`
+      });
+      const muerto = motivoEmbedMuerto(embedResponse);
+      if (muerto) return { estado: 'caducado', detalle: muerto };
+      const bloqueado = bloqueoDeIframe(embedResponse, data.url);
+      if (bloqueado) return { estado: 'caducado', detalle: bloqueado };
+      return { estado: 'ok', detalle: `embed usable (${embedResponse.statusCode})` };
+    }
+
+    const resolvedUrl = String(data.url).startsWith('http')
+      ? data.url
+      : `${STREAMFLIX_URL}${String(data.url).startsWith('/') ? '' : '/'}${data.url}`;
+    const streamResponse = await requestUrl('GET', resolvedUrl, { Accept: '*/*' });
+    if (streamResponse.statusCode >= 400) {
+      return { estado: 'caducado', detalle: `stream respondió ${streamResponse.statusCode}` };
+    }
+    if (esPlaylistValido(streamResponse)) {
+      return { estado: 'ok', detalle: 'playback resuelto a playlist válido' };
+    }
+    if (esVideoValido(streamResponse)) {
+      return { estado: 'ok', detalle: `playback resuelto a ${streamResponse.headers['content-type']}` };
+    }
+
+    return {
+      estado: 'roto',
+      detalle: `playback devolvió ${streamResponse.statusCode} ${streamResponse.headers['content-type'] || 'sin tipo'}`
+    };
+  } catch (error) {
+    return { estado: 'roto', detalle: `playback falló: ${(error.message || String(error)).slice(0, 90)}` };
+  }
+}
+
 async function probeEpisode(episode, referers) {
+  const resuelto = await probePlaybackResuelto(episode);
+  if (resuelto.estado === 'ok') {
+    return resuelto;
+  }
+
   const provider = String(episode.Provider || 'file').toLowerCase();
   const url = episode.VideoUrl;
 
@@ -304,7 +408,9 @@ async function main() {
       pelisplushd: 'https://www.pelisplushd.la/',
       cuevana3: 'https://ww9.cuevana3.to/',
       pelismart: 'https://pelismart.mov/',
-      gnula: 'https://www2.gnula.one/'
+      gnula: 'https://www2.gnula.one/',
+      pelisflix200: 'https://pelisflix200.ws/',
+      pelisplus: 'https://www.pelisplushd.la/'
     };
 
     log('\nReimportando los títulos rotos…');
